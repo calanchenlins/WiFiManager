@@ -18,14 +18,8 @@ jobs:
       with:
         dotnet-version: 8.0.x
 
-    - name: Restore
-      run: dotnet restore WiFiManager.sln
-
-    - name: Build
-      run: dotnet build WiFiManager.sln --configuration Release --no-restore
-
     - name: Publish
-      run: dotnet publish WiFiManager.sln --configuration Release --runtime win-x64 --self-contained false --no-build
+      run: dotnet publish -c Release
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
