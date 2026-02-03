@@ -69,22 +69,22 @@ jobs:
         files: |
           WiFiManager-${{ steps.get_version.outputs.VERSION }}-win-x64.zip
           WiFiManager-${{ steps.get_version.outputs.VERSION }}-win-x64.zip.sha256
-        generate_release_notes: true  # 自动生成 Release Notes
+        generate_release_notes: true  # Auto-generate Release Notes
         draft: false
         prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
         name: Release ${{ github.ref_name }}
         body: |
-          ## 📦 安装
+          ## 📦 Installation
           
-          下载 `WiFiManager-${{ steps.get_version.outputs.VERSION }}-win-x64.zip` 并解压即可使用。
+          Download `WiFiManager-${{ steps.get_version.outputs.VERSION }}-win-x64.zip` and extract it to use.
           
-          ## 🔐 校验
+          ## 🔐 Verification
           
-          使用以下命令验证文件完整性：
+          Verify file integrity using the following command:
           ```powershell
           Get-FileHash WiFiManager-${{ steps.get_version.outputs.VERSION }}-win-x64.zip -Algorithm SHA256
           ```
           
-          对比 `.sha256` 文件中的校验和。
+          Compare with the checksum in the `.sha256` file.
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
