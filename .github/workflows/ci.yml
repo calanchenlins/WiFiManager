@@ -23,20 +23,8 @@ jobs:
       with:
         dotnet-version: 8.0.x
 
-    # 添加 NuGet 缓存
-    - name: Cache NuGet packages
-      uses: actions/cache@v4
-      with:
-        path: ~/.nuget/packages
-        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
-        restore-path: |
-          ~/.nuget/packages
-
-    - name: Restore dependencies
-      run: dotnet restore
-
     - name: Publish
-      run: dotnet publish -c Release --no-restore
+      run: dotnet publish -c Release
 
     # 验证构建结果
     - name: Verify build
