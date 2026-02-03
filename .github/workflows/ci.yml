@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ "main", "master" ]
 
+# 并发控制：取消同一分支的旧构建
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
@@ -18,11 +23,37 @@ jobs:
       with:
         dotnet-version: 8.0.x
 
+    # 添加 NuGet 缓存
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+        restore-path: |
+          ~/.nuget/packages
+
+    - name: Restore dependencies
+      run: dotnet restore
+
     - name: Publish
-      run: dotnet publish -c Release
+      run: dotnet publish -c Release --no-restore
+
+    # 验证构建结果
+    - name: Verify build
+      run: |
+        if (Test-Path "bin/Release/net8.0/win-x64/publish/WiFiManager.exe") {
+          Write-Host "✓ Build successful"
+          $size = (Get-Item "bin/Release/net8.0/win-x64/publish/WiFiManager.exe").Length / 1MB
+          Write-Host "  File size: $([math]::Round($size, 2)) MB"
+        } else {
+          Write-Error "✗ Build failed: WiFiManager.exe not found"
+          exit 1
+        }
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: WiFiManager-win-x64
+        name: WiFiManager-win-x64-${{ github.sha }}
         path: bin/Release/net8.0/win-x64/publish/WiFiManager.exe
+        retention-days: 30  # 保留30天
+        compression-level: 9

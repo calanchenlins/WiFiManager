@@ -20,20 +20,83 @@ jobs:
       with:
         dotnet-version: 8.0.x
 
-    - name: Publish
-      run: dotnet publish -c Release
+    # 添加 NuGet 缓存
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+        restore-path: |
+          ~/.nuget/packages
 
+    - name: Restore dependencies
+      run: dotnet restore
+
+    - name: Publish
+      run: dotnet publish -c Release --no-restore
+
+    # 提取版本号
+    - name: Get version
+      id: get_version
+      run: |
+        $version = "${{ github.ref_name }}" -replace '^v', ''
+        echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+        echo "Version: $version"
+
+    # 创建更完整的发布包
     - name: Create Release Archive
       run: |
         $publishDir = "bin/Release/net8.0/win-x64/publish"
-        Compress-Archive -Path "$publishDir//WiFiManager.exe" -DestinationPath "WiFiManager-win-x64.zip"
+        $version = "${{ steps.get_version.outputs.VERSION }}"
+        $archiveName = "WiFiManager-$version-win-x64"
+        
+        # 创建临时目录
+        New-Item -ItemType Directory -Force -Path "release-temp"
+        
+        # 复制文件
+        Copy-Item "$publishDir/WiFiManager.exe" "release-temp/"
+        Copy-Item "README.md" "release-temp/" -ErrorAction SilentlyContinue
+        Copy-Item "LICENSE" "release-temp/" -ErrorAction SilentlyContinue
+        
+        # 生成版本信息文件
+        @"
+        WiFiManager v$version
+        Build Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        Commit: ${{ github.sha }}
+        "@ | Out-File -FilePath "release-temp/VERSION.txt" -Encoding utf8
+        
+        # 创建压缩包
+        Compress-Archive -Path "release-temp/*" -DestinationPath "$archiveName.zip"
+        
+        # 生成 SHA256 校验和
+        $hash = (Get-FileHash "$archiveName.zip" -Algorithm SHA256).Hash
+        "$hash  $archiveName.zip" | Out-File -FilePath "$archiveName.zip.sha256" -Encoding ascii
+        
+        Write-Host "✓ Created $archiveName.zip"
+        Write-Host "✓ SHA256: $hash"
 
     - name: Create GitHub Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
-        files: WiFiManager-win-x64.zip
+        files: |
+          WiFiManager-${{ steps.get_version.outputs.VERSION }}-win-x64.zip
+          WiFiManager-${{ steps.get_version.outputs.VERSION }}-win-x64.zip.sha256
         generate_release_notes: true  # 自动生成 Release Notes
         draft: false
-        prerelease: false
+        prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+        name: Release ${{ github.ref_name }}
+        body: |
+          ## 📦 安装
+          
+          下载 `WiFiManager-${{ steps.get_version.outputs.VERSION }}-win-x64.zip` 并解压即可使用。
+          
+          ## 🔐 校验
+          
+          使用以下命令验证文件完整性：
+          ```powershell
+          Get-FileHash WiFiManager-${{ steps.get_version.outputs.VERSION }}-win-x64.zip -Algorithm SHA256
+          ```
+          
+          对比 `.sha256` 文件中的校验和。
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
