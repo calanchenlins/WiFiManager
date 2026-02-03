@@ -16,7 +16,7 @@ jobs:
     - name: Setup .NET
       uses: actions/setup-dotnet@v4
       with:
-        dotnet-version: 9.0.x
+        dotnet-version: 8.0.x
 
     - name: Publish
       run: dotnet publish -c Release
@@ -25,4 +25,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: WiFiManager-win-x64
-        path: bin/Release/net8.0/win-x64/publish/
+        path: bin/Release/net8.0/win-x64/publish/WiFiManager.exe
