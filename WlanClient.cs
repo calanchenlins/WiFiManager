@@ -6,6 +6,8 @@ internal sealed partial class WlanClient : IDisposable
 {
     private readonly IntPtr _clientHandle;
     private readonly WlanNotificationCallback _notificationCallback;
+    private GCHandle _contextHandle;
+    private readonly IntPtr _contextPtr;
     private TaskCompletionSource<bool>? _connectTcs;
     private TaskCompletionSource<bool>? _scanTcs;
     private bool _disposed;
@@ -14,7 +16,9 @@ internal sealed partial class WlanClient : IDisposable
     {
         ThrowOnError(WlanOpenHandle(2, IntPtr.Zero, out var negotiatedVersion, out _clientHandle), "WlanOpenHandle");
         _notificationCallback = OnNotification;
-        ThrowOnError(WlanRegisterNotification(_clientHandle, WLAN_NOTIFICATION_SOURCE.ACM, false, _notificationCallback, IntPtr.Zero, IntPtr.Zero, out _), "WlanRegisterNotification");
+        _contextHandle = GCHandle.Alloc(this);
+        _contextPtr = GCHandle.ToIntPtr(_contextHandle);
+        ThrowOnError(WlanRegisterNotification(_clientHandle, WLAN_NOTIFICATION_SOURCE.ACM, false, _notificationCallback, _contextPtr, IntPtr.Zero, out _), "WlanRegisterNotification");
         AppDomain.CurrentDomain.ProcessExit += (_, __) => Dispose();
         AppDomain.CurrentDomain.UnhandledException += (_, __) => Dispose();
     }
@@ -226,6 +230,11 @@ internal sealed partial class WlanClient : IDisposable
         {
             WlanCloseHandle(_clientHandle, IntPtr.Zero);
         }
+
+        if (_contextHandle.IsAllocated)
+        {
+            _contextHandle.Free();
+        }
     }
 
     private void EnsureNotDisposed()
@@ -243,6 +252,9 @@ internal sealed partial class WlanClient : IDisposable
             return;
         }
 
+        var isHandling = context == _contextPtr;
+        var contextSource = isHandling ? nameof(WlanClient) : "WLAN AutoConfig";
+
         var code = (WLAN_NOTIFICATION_ACM)notificationData.NotificationCode;
         switch (code)
         {
@@ -250,27 +262,42 @@ internal sealed partial class WlanClient : IDisposable
                 var success = TryGetConnectionSucceeded(notificationData, out var reasonCode);
                 if (!success)
                 {
-                    Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Connection completed with failure reason {reasonCode} (0x{(uint)reasonCode:X}).");
+                    Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] [{contextSource}] Connection completed with failure reason {reasonCode} (0x{(uint)reasonCode:X}).");
                 }
                 else
                 {
-                    Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Connection completed successfully.");
+                    Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] [{contextSource}] Connection completed successfully.");
                 }
-                _connectTcs?.TrySetResult(success);
+                if (isHandling)
+                {
+                    _connectTcs?.TrySetResult(success);
+                }
                 break;
             case WLAN_NOTIFICATION_ACM.ConnectionAttemptFail:
                 var hasReason = TryGetConnectionReason(notificationData, out var failReason);
                 var reasonText = hasReason ? $"{failReason} (0x{(uint)failReason:X})" : "unknown";
-                Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Connection attempt failed: {reasonText}.");
+                Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] [{contextSource}] Connection attempt failed: {reasonText}.");
                 break;
             case WLAN_NOTIFICATION_ACM.Disconnected:
-                _connectTcs?.TrySetResult(false);
+                Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] [{contextSource}] Connection Disconnected.");
+                if (isHandling)
+                {
+                    _connectTcs?.TrySetResult(false);
+                }
                 break;
             case WLAN_NOTIFICATION_ACM.ScanComplete:
-                _scanTcs?.TrySetResult(true);
+                Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] [{contextSource}] Scan completed.");
+                if (isHandling)
+                {
+                    _scanTcs?.TrySetResult(true);
+                }
                 break;
             case WLAN_NOTIFICATION_ACM.ScanFail:
-                _scanTcs?.TrySetResult(false);
+                Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] [{contextSource}] Scan failed.");
+                if (isHandling)
+                {
+                    _scanTcs?.TrySetResult(false);
+                }
                 break;
         }
     }
