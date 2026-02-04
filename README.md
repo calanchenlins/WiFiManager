@@ -2,6 +2,8 @@
 
 [中文](#简介) | [English](#introduction)
 
+![.NET](https://img.shields.io/badge/.NET-8.0-512BD4) ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6) ![License](https://img.shields.io/badge/License-MIT-green)
+
 ---
 
 ## Introduction
@@ -12,40 +14,65 @@ Built with .NET 8 and utilizes the Native Windows WLAN API.
 
 ### Key Features
 
-*   **Connection Monitoring**: Continuously pings a gateway and automatically reconnects if the connection drops.
+*   **Connection Monitoring (Two Modes)**:
+    *   **Gateway Mode**: Continuously pings a gateway and automatically reconnects if the connection drops.
+    *   **BSSID Mode**: Monitors the current connection and reconnects if disconnected or connected to a different SSID/BSSID.
 *   **BSSID Locking**: Can target a specific Access Point (BSSID), useful for troubleshooting roaming issues or connecting to a specific node in a mesh network.
 *   **Detailed Scanning**:
     *   **Network Mode**: Summarizes available networks by SSID.
     *   **BSSID Mode**: Lists every visible AP with details like Frequency, RSSI, Link Quality, PHY type, and Band (2.4GHz/5GHz/6GHz).
 *   **Single File**: Compiled as a self-contained, single-file executable for easy deployment.
 
+### System Requirements
+
+- Windows 10 version 1809 (build 17763) or later
+- Administrator privileges may be required for some operations
+- A Wi-Fi adapter with proper drivers installed
+
+### Quick Reference
+
+| Command | Description |
+|---------|-------------|
+| `WiFiManager scan` | Scan networks (summary) |
+| `WiFiManager scan -m bssid` | Scan networks (detailed) |
+| `WiFiManager connect -s "WiFi" -g 192.168.1.1` | Gateway mode |
+| `WiFiManager connect -s "WiFi" -b "AA:BB:CC:DD:EE:FF"` | BSSID mode |
+| `WiFiManager show interface` | List Wi-Fi interfaces |
+
 ## Usage
 
 ### 1. Connect & Monitor
 
-Monitor connectivity to a gateway and reconnect to a specific WiFi network if it fails.
+Monitor connectivity and reconnect to a specific WiFi network when needed. **You must choose one mode: Gateway or BSSID.**
 
 ```powershell
-# Basic usage
-WiFiManager.exe connect --ssid "MyWiFi" --gateway 192.168.1.1 --password "topsecret" 
-# Note: Password handling might depend on profile existence; this tool mainly triggers connection to existing profiles or open networks.
-# Based on code, it uses existing profiles matching the SSID.
+# Gateway Mode: Ping gateway to check connectivity
+WiFiManager.exe connect --ssid "MyWiFi" --gateway 192.168.1.1
 
-# Connect to a specific BSSID (MAC Address)
-WiFiManager.exe connect --ssid "MyWiFi" --bssid "12:34:56:78:90:AB" --gateway 192.168.1.1
+# BSSID Mode: Monitor connection to a specific BSSID
+WiFiManager.exe connect --ssid "MyWiFi" --bssid "12:34:56:78:90:AB"
 
 # Specify interface by name or GUID
 WiFiManager.exe connect --ssid "MyWiFi" --gateway 192.168.1.1 --interface "Intel(R) Wi-Fi"
 ```
 
+> Note: This tool uses existing Wi-Fi profiles saved in Windows. It triggers connection to profiles matching the SSID.
+
 **Options:**
 
-*   `-s, --ssid`: (Required after merging config + CLI) The SSID of the Wi-Fi network.
-*   `-b, --bssid`: (Optional) The specific BSSID (MAC address) to connect to.
-*   `-g, --gateway`: (Required after merging config + CLI) The IP address of the gateway to ping for connectivity checks.
-*   `-i, --interval`: (Optional) Ping interval in seconds (default: 5).
+*   `-s, --ssid`: (Required) The SSID of the Wi-Fi network.
+*   `-b, --bssid`: The specific BSSID (MAC address) to connect to. **Cannot be used with `--gateway`.**
+*   `-g, --gateway`: The IP address of the gateway to ping for connectivity checks. **Cannot be used with `--bssid`.**
+*   `-i, --interval`: (Optional) Check interval in seconds (default: 5).
 *   `-c, --config`: (Optional) Path to a JSON configuration file.
 *   `-n, --interface`: (Optional) Target Wi-Fi interface (GUID or name substring). Defaults to the first interface.
+
+**Mode Behavior:**
+
+| Mode | Trigger Reconnection When |
+|------|---------------------------|
+| Gateway | Gateway ping fails |
+| BSSID | Not connected, or connected to different SSID/BSSID |
 
 ### 2. Scan Networks
 
@@ -77,17 +104,27 @@ WiFiManager.exe show interface
 
 ### Configuration File
 
-You can use a JSON file instead of command-line arguments:
+You can use a JSON file instead of command-line arguments.
 
-`config.json`:
+**Gateway Mode** (`config.json`):
 ```json
 {
   "SSID": "MyWiFi",
-  "BSSID": "aa:bb:cc:dd:ee:ff",
   "Gateway": "192.168.1.1",
   "Interval": 10
 }
 ```
+
+**BSSID Mode** (`config.json`):
+```json
+{
+  "SSID": "MyWiFi",
+  "BSSID": "aa:bb:cc:dd:ee:ff",
+  "Interval": 10
+}
+```
+
+> Note: `Gateway` and `BSSID` are mutually exclusive. Specify only one.
 
 Run with config:
 ```powershell
@@ -113,6 +150,37 @@ dotnet publish -c Release
 ```
 
 The executable will be in `bin/Release/net8.0/win-x64/publish/`.
+
+## Troubleshooting
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| `Connection attempt failed` | Wi-Fi profile not saved in Windows | Manually connect to the network once via Windows Settings to create the profile |
+| `No Wi-Fi interfaces found` | No wireless adapter detected or driver issue | Check Device Manager, ensure Wi-Fi adapter is enabled and drivers are installed |
+| `Access is denied` (Error 5) | Insufficient permissions | Run as Administrator, or ensure the user has rights to manage Wi-Fi |
+| `The network is not available` | Target SSID not in range or hidden | Move closer to AP, or ensure SSID is broadcasting |
+| Connection drops repeatedly | Weak signal or interference | Use `scan --mode bssid` to check signal strength; consider BSSID lock to prevent roaming |
+| Service fails to connect | SYSTEM account cannot access user Wi-Fi profiles | Export the profile as "All Users" using `netsh wlan export profile folder=. key=clear` and re-import |
+
+**Useful diagnostic commands:**
+
+```powershell
+# List saved Wi-Fi profiles
+netsh wlan show profiles
+
+# Show detailed profile info (including password if admin)
+netsh wlan show profile name="MyWiFi" key=clear
+
+# Check current connection status
+netsh wlan show interfaces
+```
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|  
+| 0 | Success or graceful shutdown (Ctrl+C) |
+| 1 | Configuration error or runtime failure |
 
 ## License
 
@@ -181,40 +249,65 @@ Logs are stored in the same directory by default (rolling logs).
 
 ### 主要功能
 
-*   **连接监控**：持续 Ping 指定网关，一旦检测到掉线即自动尝试重连。
+*   **连接监控（两种模式）**：
+    *   **Gateway 模式**：持续 Ping 指定网关，一旦检测到掉线即自动尝试重连。
+    *   **BSSID 模式**：监控当前连接状态，若未连接或连接到不同的 SSID/BSSID 则自动重连。
 *   **BSSID 锁定**：可以指定连接到特定的接入点（BSSID），这在排查漫游问题或连接到 Mesh 网络中的特定节点时非常有用。
 *   **详细扫描**：
     *   **网络模式**：按 SSID 汇总可用网络。
     *   **BSSID 模式**：列出每个可见的 AP 详细信息，包括频率、RSSI、链路质量、PHY 类型和频段（2.4GHz/5GHz/6GHz）。
 *   **单文件**：编译为自包含的单文件可执行程序，无需安装运行时，便于部署。
 
+### 系统要求
+
+- Windows 10 版本 1809（内部版本 17763）或更高版本
+- 部分操作可能需要管理员权限
+- 已安装正确驱动程序的 Wi-Fi 适配器
+
+### 命令速查
+
+| 命令 | 说明 |
+|------|------|
+| `WiFiManager scan` | 扫描网络（摘要） |
+| `WiFiManager scan -m bssid` | 扫描网络（详细） |
+| `WiFiManager connect -s "WiFi" -g 192.168.1.1` | Gateway 模式 |
+| `WiFiManager connect -s "WiFi" -b "AA:BB:CC:DD:EE:FF"` | BSSID 模式 |
+| `WiFiManager show interface` | 显示网卡列表 |
+
 ## 使用说明
 
 ### 1. 连接与监控
 
-监控到网关的连通性，并在失败时重连到指定的 Wi-Fi。
+监控网络连通性，并在需要时重连到指定的 Wi-Fi。**必须选择一种模式：Gateway 或 BSSID。**
 
 ```powershell
-# 基本用法
+# Gateway 模式：通过 Ping 网关检测连通性
 WiFiManager.exe connect --ssid "MyWiFi" --gateway 192.168.1.1
 
-# 注意：该工具主要利用 Windows 中已保存的配置文件进行连接。
-
-# 连接到特定 BSSID (MAC 地址)
-WiFiManager.exe connect --ssid "MyWiFi" --bssid "12:34:56:78:90:AB" --gateway 192.168.1.1
+# BSSID 模式：监控到特定 BSSID 的连接
+WiFiManager.exe connect --ssid "MyWiFi" --bssid "12:34:56:78:90:AB"
 
 # 指定网卡接口（名称或 GUID）
 WiFiManager.exe connect --ssid "MyWiFi" --gateway 192.168.1.1 --interface "Intel(R) Wi-Fi"
 ```
 
+> 注意：该工具主要利用 Windows 中已保存的 Wi-Fi 配置文件进行连接。
+
 **参数：**
 
-*   `-s, --ssid`: （合并配置文件与命令行参数后必填）Wi-Fi 名称 (SSID)。
-*   `-b, --bssid`: (选填) 要连接的特定 BSSID (MAC 地址)。
-*   `-g, --gateway`: （合并配置文件与命令行参数后必填）用于检测连通性的网关 IP 地址。
-*   `-i, --interval`: (选填) Ping 检测间隔，单位秒 (默认: 5)。
+*   `-s, --ssid`: （必填）Wi-Fi 名称 (SSID)。
+*   `-b, --bssid`: 要连接的特定 BSSID (MAC 地址)。**不能与 `--gateway` 同时使用。**
+*   `-g, --gateway`: 用于检测连通性的网关 IP 地址。**不能与 `--bssid` 同时使用。**
+*   `-i, --interval`: (选填) 检测间隔，单位秒 (默认: 5)。
 *   `-c, --config`: (选填) JSON 配置文件路径。
 *   `-n, --interface`: (选填) 目标 Wi-Fi 网卡（GUID 或名称关键字）。默认使用首个无线网卡。
+
+**模式行为：**
+
+| 模式 | 触发重连条件 |
+|------|-------------|
+| Gateway | 网关 Ping 失败 |
+| BSSID | 未连接，或连接到不同的 SSID/BSSID |
 
 ### 2. 扫描网络
 
@@ -246,17 +339,27 @@ WiFiManager.exe show interface
 
 ### 配置文件
 
-你可以使用 JSON 文件来替代命令行参数：
+你可以使用 JSON 文件来替代命令行参数。
 
-`config.json`:
+**Gateway 模式** (`config.json`):
 ```json
 {
   "SSID": "MyWiFi",
-  "BSSID": "aa:bb:cc:dd:ee:ff",
   "Gateway": "192.168.1.1",
   "Interval": 10
 }
 ```
+
+**BSSID 模式** (`config.json`):
+```json
+{
+  "SSID": "MyWiFi",
+  "BSSID": "aa:bb:cc:dd:ee:ff",
+  "Interval": 10
+}
+```
+
+> 注意：`Gateway` 和 `BSSID` 互斥，只能指定其中一个。
 
 使用配置运行：
 ```powershell
@@ -282,6 +385,37 @@ dotnet publish -c Release
 ```
 
 生成的可执行文件位于 `bin/Release/net8.0/win-x64/publish/`。
+
+## 故障排除
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| `Connection attempt failed` | Windows 中未保存该 Wi-Fi 配置文件 | 先通过 Windows 设置手动连接一次该网络以创建配置文件 |
+| `No Wi-Fi interfaces found` | 未检测到无线网卡或驱动问题 | 检查设备管理器，确保 Wi-Fi 适配器已启用且驱动已安装 |
+| `Access is denied` (错误 5) | 权限不足 | 以管理员身份运行，或确保用户具有管理 Wi-Fi 的权限 |
+| `The network is not available` | 目标 SSID 不在范围内或为隐藏网络 | 靠近接入点，或确保 SSID 正在广播 |
+| 连接反复断开 | 信号弱或干扰 | 使用 `scan --mode bssid` 检查信号强度；考虑使用 BSSID 锁定防止漫游 |
+| 服务无法连接 | SYSTEM 账户无法访问用户的 Wi-Fi 配置文件 | 使用 `netsh wlan export profile folder=. key=clear` 导出配置文件为"所有用户"，然后重新导入 |
+
+**常用诊断命令：**
+
+```powershell
+# 列出已保存的 Wi-Fi 配置文件
+netsh wlan show profiles
+
+# 显示详细配置信息（管理员可查看密码）
+netsh wlan show profile name="MyWiFi" key=clear
+
+# 检查当前连接状态
+netsh wlan show interfaces
+```
+
+## 退出码
+
+| 代码 | 含义 |
+|------|------|
+| 0 | 成功或正常退出（Ctrl+C） |
+| 1 | 配置错误或运行时错误 |
 
 ## 许可证
 

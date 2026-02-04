@@ -2,38 +2,97 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
 
+/// <summary>
+/// A simple wrapper for native memory that ensures proper cleanup.
+/// </summary>
+internal sealed class SafeNativeMemory : IDisposable
+{
+    private IntPtr _pointer;
+
+    public SafeNativeMemory()
+    {
+        _pointer = IntPtr.Zero;
+    }
+
+    public SafeNativeMemory(int size)
+    {
+        _pointer = size > 0 ? Marshal.AllocHGlobal(size) : IntPtr.Zero;
+    }
+
+    public IntPtr Pointer => _pointer;
+
+    public void TakeOwnership(IntPtr ptr)
+    {
+        if (_pointer != IntPtr.Zero)
+        {
+            Marshal.FreeHGlobal(_pointer);
+        }
+        _pointer = ptr;
+    }
+
+    public void Dispose()
+    {
+        if (_pointer != IntPtr.Zero)
+        {
+            Marshal.FreeHGlobal(_pointer);
+            _pointer = IntPtr.Zero;
+        }
+    }
+}
+
+/// <summary>
+/// Provides a managed wrapper for Windows WLAN API operations.
+/// </summary>
+/// <remarks>
+/// This class manages native WLAN resources and must be disposed when no longer needed.
+/// It supports Wi-Fi interface enumeration, connection management, and network scanning.
+/// </remarks>
 internal sealed partial class WlanClient : IDisposable
 {
+    private const uint ClientVersion = 2;
+    private const int ERROR_INVALID_STATE = 5023;
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan ScanTimeout = TimeSpan.FromSeconds(15);
+
     private readonly IntPtr _clientHandle;
+    // Must keep a reference to the callback delegate to prevent GC from collecting it while native code holds a pointer.
     private readonly WlanNotificationCallback _notificationCallback;
-    private GCHandle _contextHandle;
-    private readonly IntPtr _contextPtr;
+    private readonly EventHandler _processExitHandler;
+    private readonly UnhandledExceptionEventHandler _unhandledExceptionHandler;
     private TaskCompletionSource<bool>? _connectTcs;
     private TaskCompletionSource<bool>? _scanTcs;
-    private bool _disposed;
+    private int _disposed; // 0 = not disposed, 1 = disposed
 
     public WlanClient()
     {
-        ThrowOnError(WlanOpenHandle(2, IntPtr.Zero, out var negotiatedVersion, out _clientHandle), "WlanOpenHandle");
-        _notificationCallback = OnNotification;
-        _contextHandle = GCHandle.Alloc(this);
-        _contextPtr = GCHandle.ToIntPtr(_contextHandle);
-        ThrowOnError(WlanRegisterNotification(_clientHandle, WLAN_NOTIFICATION_SOURCE.ACM, false, _notificationCallback, _contextPtr, IntPtr.Zero, out _), "WlanRegisterNotification");
-        AppDomain.CurrentDomain.ProcessExit += (_, __) => Dispose();
-        AppDomain.CurrentDomain.UnhandledException += (_, __) => Dispose();
-    }
-
-    public Guid? GetPrimaryInterface()
-    {
-        var interfaces = GetInterfaces();
-        // 控制台输出网卡信息
-        foreach (var iface in interfaces)
+        ThrowOnError(WlanOpenHandle(ClientVersion, IntPtr.Zero, out var negotiatedVersion, out _clientHandle), "WlanOpenHandle");
+        try
         {
-            Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Found interface: {iface.strInterfaceDescription} (State: {iface.isState}, GUID: {iface.InterfaceGuid})");
+            _notificationCallback = OnNotification;
+            ThrowOnError(WlanRegisterNotification(_clientHandle, WLAN_NOTIFICATION_SOURCE.ACM, false, _notificationCallback, IntPtr.Zero, IntPtr.Zero, out _), "WlanRegisterNotification");
+            _processExitHandler = (_, __) => Dispose();
+            _unhandledExceptionHandler = (_, __) => Dispose();
+            AppDomain.CurrentDomain.ProcessExit += _processExitHandler;
+            AppDomain.CurrentDomain.UnhandledException += _unhandledExceptionHandler;
         }
-        return interfaces.Count > 0 ? interfaces[0].InterfaceGuid : null;
+        catch
+        {
+            WlanCloseHandle(_clientHandle, IntPtr.Zero);
+            throw;
+        }
     }
 
+    ~WlanClient()
+    {
+        Dispose();
+    }
+
+    /// <summary>
+    /// Enumerates all available Wi-Fi interfaces on the system.
+    /// </summary>
+    /// <returns>A read-only list of available Wi-Fi interfaces.</returns>
+    /// <exception cref="ObjectDisposedException">Thrown when the client has been disposed.</exception>
+    /// <exception cref="Win32Exception">Thrown when the native API call fails.</exception>
     public IReadOnlyList<WLAN_INTERFACE_INFO> GetInterfaces()
     {
         EnsureNotDisposed();
@@ -59,6 +118,18 @@ internal sealed partial class WlanClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// Asynchronously connects to a Wi-Fi network using the specified SSID and optional BSSID.
+    /// </summary>
+    /// <param name="interfaceId">The GUID of the Wi-Fi interface to use for the connection.</param>
+    /// <param name="ssid">The SSID of the network to connect to.</param>
+    /// <param name="bssid">The optional BSSID (MAC address) of the specific access point to connect to.</param>
+    /// <param name="cancellationToken">A token to cancel the connection attempt.</param>
+    /// <returns>A task that completes when the connection is established or fails.</returns>
+    /// <exception cref="ArgumentException">Thrown when the SSID is null or empty.</exception>
+    /// <exception cref="ObjectDisposedException">Thrown when the client has been disposed.</exception>
+    /// <exception cref="InvalidOperationException">Thrown when the connection attempt fails.</exception>
+    /// <exception cref="OperationCanceledException">Thrown when the operation is canceled or times out.</exception>
     public async Task ConnectAsync(Guid interfaceId, string ssid, string? bssid, CancellationToken cancellationToken)
     {
         EnsureNotDisposed();
@@ -69,37 +140,40 @@ internal sealed partial class WlanClient : IDisposable
         }
 
         var ssidStruct = WlanNative.CreateSsid(ssid);
-        var ssidPtr = Marshal.AllocHGlobal(Marshal.SizeOf<DOT11_SSID>());
-        Marshal.StructureToPtr(ssidStruct, ssidPtr, false);
+        using var ssidMem = new SafeNativeMemory(Marshal.SizeOf<DOT11_SSID>());
+        using var bssidMem = new SafeNativeMemory();
+        using var profileMem = new SafeNativeMemory();
+        TaskCompletionSource<bool>? tcs = null;
 
-        IntPtr bssidPtr = IntPtr.Zero;
-        IntPtr profilePtr = IntPtr.Zero;
         try
         {
+            Marshal.StructureToPtr(ssidStruct, ssidMem.Pointer, false);
+
             if (!string.IsNullOrWhiteSpace(bssid))
             {
-                bssidPtr = WlanNative.CreateBssidList(bssid!);
+                bssidMem.TakeOwnership(WlanNative.CreateBssidList(bssid!));
             }
 
-            profilePtr = Marshal.StringToHGlobalUni(ssid);
-            var parameters = new WLAN_CONNECTION_PARAMETERS_NATIVE
-            {
-                wlanConnectionMode = WLAN_CONNECTION_MODE.Profile,
-                strProfile = profilePtr,
-                pDot11Ssid = ssidPtr,
-                pDesiredBssidList = bssidPtr,
-                dot11BssType = DOT11_BSS_TYPE.Any,
-                dwFlags = 0
-            };
+            profileMem.TakeOwnership(Marshal.StringToHGlobalUni(ssid));
+            var parameters = new WLAN_CONNECTION_PARAMETERS_NATIVE(
+                WLAN_CONNECTION_MODE.Profile,
+                profileMem.Pointer,
+                ssidMem.Pointer,
+                bssidMem.Pointer,
+                DOT11_BSS_TYPE.Any,
+                0);
 
-            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _connectTcs = tcs;
+            tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            // Set TCS before calling API to avoid race condition where notification arrives before TCS is set
+            var oldTcs = Interlocked.Exchange(ref _connectTcs, tcs);
+            oldTcs?.TrySetCanceled();
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(ConnectTimeout);
+            using var reg = timeoutCts.Token.Register(() => tcs.TrySetCanceled(timeoutCts.Token));
 
             ThrowOnError(WlanConnect(_clientHandle, ref interfaceId, ref parameters, IntPtr.Zero), "WlanConnect");
 
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(TimeSpan.FromSeconds(20));
-            using var reg = timeoutCts.Token.Register(() => tcs.TrySetCanceled(timeoutCts.Token));
             var completed = await tcs.Task.ConfigureAwait(false);
             if (!completed)
             {
@@ -108,23 +182,87 @@ internal sealed partial class WlanClient : IDisposable
         }
         finally
         {
-            _connectTcs = null;
-            Marshal.FreeHGlobal(ssidPtr);
-            if (bssidPtr != IntPtr.Zero)
+            // Only clear if we set it (avoids clearing a newer TCS set by another call)
+            if (tcs != null)
             {
-                Marshal.FreeHGlobal(bssidPtr);
+                Interlocked.CompareExchange(ref _connectTcs, null, tcs);
             }
-            // Free unmanaged profile string used in native parameters.
-            Marshal.FreeHGlobal(profilePtr);
+            // Native memory is automatically freed by SafeNativeMemory.Dispose()
         }
     }
 
+    /// <summary>
+    /// Gets information about the current Wi-Fi connection on the specified interface.
+    /// </summary>
+    /// <param name="interfaceId">The GUID of the Wi-Fi interface to query.</param>
+    /// <returns>
+    /// A <see cref="CurrentConnectionInfo"/> containing connection details.
+    /// If not connected, <see cref="CurrentConnectionInfo.IsConnected"/> will be <c>false</c>.
+    /// </returns>
+    /// <exception cref="ObjectDisposedException">Thrown when the client has been disposed.</exception>
+    /// <exception cref="Win32Exception">Thrown when the native API call fails.</exception>
+    public CurrentConnectionInfo GetCurrentConnection(Guid interfaceId)
+    {
+        EnsureNotDisposed();
+
+        var result = WlanQueryInterface(
+            _clientHandle,
+            ref interfaceId,
+            WLAN_INTF_OPCODE.CurrentConnection,
+            IntPtr.Zero,
+            out var dataSize,
+            out var dataPtr,
+            out _);
+
+        // ERROR_INVALID_STATE means not connected
+        if (result == ERROR_INVALID_STATE)
+        {
+            return new CurrentConnectionInfo(false, null, null, 0);
+        }
+
+        if (result != 0)
+        {
+            throw new Win32Exception(result, $"WlanQueryInterface failed with error {result}");
+        }
+
+        try
+        {
+            var attrs = Marshal.PtrToStructure<WLAN_CONNECTION_ATTRIBUTES>(dataPtr);
+            var ssid = WlanNative.SsidToString(attrs.wlanAssociationAttributes.dot11Ssid);
+            var bssid = WlanNative.MacToString(attrs.wlanAssociationAttributes.dot11Bssid.Address);
+            var signalQuality = attrs.wlanAssociationAttributes.wlanSignalQuality;
+            return new CurrentConnectionInfo(true, ssid, bssid, signalQuality);
+        }
+        finally
+        {
+            WlanFreeMemory(dataPtr);
+        }
+    }
+
+    /// <summary>
+    /// Triggers a Wi-Fi scan and returns the list of available networks.
+    /// </summary>
+    /// <param name="interfaceId">The GUID of the Wi-Fi interface to use for scanning.</param>
+    /// <param name="cancellationToken">A token to cancel the scan operation.</param>
+    /// <returns>A read-only list of available Wi-Fi networks grouped by SSID.</returns>
+    /// <exception cref="ObjectDisposedException">Thrown when the client has been disposed.</exception>
+    /// <exception cref="InvalidOperationException">Thrown when the scan fails.</exception>
+    /// <exception cref="OperationCanceledException">Thrown when the operation is canceled or times out.</exception>
     public async Task<IReadOnlyList<AvailableNetwork>> ScanAsync(Guid interfaceId, CancellationToken cancellationToken)
     {
         await PerformScanAsync(interfaceId, cancellationToken).ConfigureAwait(false);
         return GetAvailableNetworks(interfaceId);
     }
 
+    /// <summary>
+    /// Triggers a Wi-Fi scan and returns the list of BSS (Basic Service Set) entries.
+    /// </summary>
+    /// <param name="interfaceId">The GUID of the Wi-Fi interface to use for scanning.</param>
+    /// <param name="cancellationToken">A token to cancel the scan operation.</param>
+    /// <returns>A read-only list of BSS entries with detailed per-access-point information.</returns>
+    /// <exception cref="ObjectDisposedException">Thrown when the client has been disposed.</exception>
+    /// <exception cref="InvalidOperationException">Thrown when the scan fails.</exception>
+    /// <exception cref="OperationCanceledException">Thrown when the operation is canceled or times out.</exception>
     public async Task<IReadOnlyList<BssEntry>> ScanBssAsync(Guid interfaceId, CancellationToken cancellationToken)
     {
         await PerformScanAsync(interfaceId, cancellationToken).ConfigureAwait(false);
@@ -135,16 +273,19 @@ internal sealed partial class WlanClient : IDisposable
     {
         EnsureNotDisposed();
 
-        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _scanTcs = tcs;
+        TaskCompletionSource<bool>? tcs = null;
         try
         {
-            ThrowOnError(WlanScan(_clientHandle, ref interfaceId, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero), "WlanScan");
+            tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            // Set TCS before calling API to avoid race condition where notification arrives before TCS is set
+            var oldTcs = Interlocked.Exchange(ref _scanTcs, tcs);
+            oldTcs?.TrySetCanceled();
 
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(TimeSpan.FromSeconds(15));
+            timeoutCts.CancelAfter(ScanTimeout);
             using var reg = timeoutCts.Token.Register(() => tcs.TrySetCanceled(timeoutCts.Token));
 
+            ThrowOnError(WlanScan(_clientHandle, ref interfaceId, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero), "WlanScan");
 
             var completed = await tcs.Task.ConfigureAwait(false);
             if (!completed)
@@ -154,7 +295,11 @@ internal sealed partial class WlanClient : IDisposable
         }
         finally
         {
-            _scanTcs = null;
+            // Only clear if we set it (avoids clearing a newer TCS set by another call)
+            if (tcs != null)
+            {
+                Interlocked.CompareExchange(ref _scanTcs, null, tcs);
+            }
         }
     }
 
@@ -220,26 +365,28 @@ internal sealed partial class WlanClient : IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
+        // Thread-safe disposal using Interlocked
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
         {
             return;
         }
 
-        _disposed = true;
+        GC.SuppressFinalize(this);
+
+        // Close handle first to stop receiving notifications
         if (_clientHandle != IntPtr.Zero)
         {
             WlanCloseHandle(_clientHandle, IntPtr.Zero);
         }
 
-        if (_contextHandle.IsAllocated)
-        {
-            _contextHandle.Free();
-        }
+        // Then unregister event handlers
+        AppDomain.CurrentDomain.ProcessExit -= _processExitHandler;
+        AppDomain.CurrentDomain.UnhandledException -= _unhandledExceptionHandler;
     }
 
     private void EnsureNotDisposed()
     {
-        if (_disposed)
+        if (Volatile.Read(ref _disposed) != 0)
         {
             throw new ObjectDisposedException(nameof(WlanClient));
         }
@@ -252,51 +399,48 @@ internal sealed partial class WlanClient : IDisposable
             return;
         }
 
-        var isHandling = context == _contextPtr;
-        var contextSource = isHandling ? nameof(WlanClient) : "WLAN AutoConfig";
-
         var code = (WLAN_NOTIFICATION_ACM)notificationData.NotificationCode;
+
         switch (code)
         {
             case WLAN_NOTIFICATION_ACM.ConnectionComplete:
                 var success = TryGetConnectionSucceeded(notificationData, out var reasonCode);
-                if (!success)
+                var connectTcs = Interlocked.Exchange(ref _connectTcs, null);
+                if (connectTcs != null)
                 {
-                    Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] [{contextSource}] Connection completed with failure reason {reasonCode} (0x{(uint)reasonCode:X}).");
-                }
-                else
-                {
-                    Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] [{contextSource}] Connection completed successfully.");
-                }
-                if (isHandling)
-                {
-                    _connectTcs?.TrySetResult(success);
+                    if (!success)
+                    {
+                        Logger.Log($"Connection completed with failure reason {reasonCode} (0x{(uint)reasonCode:X}).");
+                    }
+                    else
+                    {
+                        Logger.Log("Connection completed successfully.");
+                    }
+                    connectTcs.TrySetResult(success);
                 }
                 break;
             case WLAN_NOTIFICATION_ACM.ConnectionAttemptFail:
                 var hasReason = TryGetConnectionReason(notificationData, out var failReason);
                 var reasonText = hasReason ? $"{failReason} (0x{(uint)failReason:X})" : "unknown";
-                Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] [{contextSource}] Connection attempt failed: {reasonText}.");
+                Logger.Log($"Connection attempt failed: {reasonText}.");
                 break;
             case WLAN_NOTIFICATION_ACM.Disconnected:
-                Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] [{contextSource}] Connection Disconnected.");
-                if (isHandling)
-                {
-                    _connectTcs?.TrySetResult(false);
-                }
+                Logger.Log("Connection Disconnected.");
                 break;
             case WLAN_NOTIFICATION_ACM.ScanComplete:
-                Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] [{contextSource}] Scan completed.");
-                if (isHandling)
+                var scanTcs = Interlocked.Exchange(ref _scanTcs, null);
+                if (scanTcs != null)
                 {
-                    _scanTcs?.TrySetResult(true);
+                    Logger.Log("Scan completed.");
+                    scanTcs.TrySetResult(true);
                 }
                 break;
             case WLAN_NOTIFICATION_ACM.ScanFail:
-                Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] [{contextSource}] Scan failed.");
-                if (isHandling)
+                var scanFailTcs = Interlocked.Exchange(ref _scanTcs, null);
+                if (scanFailTcs != null)
                 {
-                    _scanTcs?.TrySetResult(false);
+                    Logger.Log("Scan failed.");
+                    scanFailTcs.TrySetResult(false);
                 }
                 break;
         }
@@ -406,6 +550,16 @@ internal sealed partial class WlanClient : IDisposable
         IntPtr pReserved,
         out IntPtr ppWlanBssList);
 
+    [LibraryImport(WlanApi, SetLastError = true)]
+    private static partial int WlanQueryInterface(
+        IntPtr hClientHandle,
+        ref Guid pInterfaceGuid,
+        WLAN_INTF_OPCODE OpCode,
+        IntPtr pReserved,
+        out int pdwDataSize,
+        out IntPtr ppData,
+        out WLAN_OPCODE_VALUE_TYPE pWlanOpcodeValueType);
+
     #endregion
 }
 
@@ -413,20 +567,16 @@ internal static class WlanNative
 {
     public static DOT11_SSID CreateSsid(string ssid)
     {
-        var ssidBytes = Encoding.ASCII.GetBytes(ssid);
+        var ssidBytes = Encoding.UTF8.GetBytes(ssid);
         if (ssidBytes.Length > 32)
         {
-            throw new ArgumentException("SSID length must be 32 bytes or less.", nameof(ssid));
+            throw new ArgumentException("SSID length must be 32 bytes or less when UTF-8 encoded.", nameof(ssid));
         }
 
         var buffer = new byte[32];
         Array.Copy(ssidBytes, buffer, ssidBytes.Length);
 
-        return new DOT11_SSID
-        {
-            SSIDLength = (uint)ssidBytes.Length,
-            SSID = buffer
-        };
+        return new DOT11_SSID((uint)ssidBytes.Length, buffer);
     }
 
     public static IntPtr CreateBssidList(string bssid)
@@ -434,17 +584,12 @@ internal static class WlanNative
         var macBytes = ParseMac(bssid);
         var list = new DOT11_BSSID_LIST
         {
-            Header = new NDIS_OBJECT_HEADER
-            {
-                Type = 0,
-                Revision = 1,
-                Size = (ushort)Marshal.SizeOf<DOT11_BSSID_LIST>()
-            },
+            Header = new NDIS_OBJECT_HEADER(0, 1, (ushort)Marshal.SizeOf<DOT11_BSSID_LIST>()),
             NumOfEntries = 1,
             TotalNumOfEntries = 1,
             BssidEntry = new DOT11_BSSID_ENTRY
             {
-                Bssid = new DOT11_MAC_ADDRESS { Address = macBytes },
+                Bssid = new DOT11_MAC_ADDRESS(macBytes),
                 BssType = DOT11_BSS_TYPE.Any,
                 PhyType = DOT11_PHY_TYPE.Unknown,
                 Reserved = new byte[16]
@@ -464,7 +609,24 @@ internal static class WlanNative
         }
 
         var length = (int)Math.Min(ssid.SSIDLength, (uint)ssid.SSID.Length);
-        return Encoding.ASCII.GetString(ssid.SSID, 0, length);
+        var span = ssid.SSID.AsSpan(0, length);
+
+        // Validate UTF-8 encoding; fall back to Latin-1 (ISO-8859-1) if invalid
+        // Latin-1 preserves raw bytes as characters, which is better than ASCII for SSIDs with extended characters
+        if (System.Text.Unicode.Utf8.IsValid(span))
+        {
+            // For valid UTF-8, we need to decode properly as char count may differ from byte count
+            return Encoding.UTF8.GetString(span);
+        }
+
+        // Latin-1: one byte = one char, use string.Create to avoid intermediate allocations
+        return string.Create(length, ssid.SSID, static (chars, source) =>
+        {
+            for (var i = 0; i < chars.Length; i++)
+            {
+                chars[i] = (char)source[i];
+            }
+        });
     }
 
     public static string MacToString(byte[] address)
@@ -498,18 +660,41 @@ internal static class WlanNative
 
     private static char GetHex(int value) => (char)((value & 0xF) > 9 ? 'A' + ((value & 0xF) - 10) : '0' + (value & 0xF));
 
-    private static byte[] ParseMac(string bssid)
+    private static byte[] ParseMac(ReadOnlySpan<char> bssid)
     {
-        var normalized = bssid.Replace("-", string.Empty).Replace(":", string.Empty);
-        if (normalized.Length != 12)
+        var bytes = new byte[6];
+        var byteIndex = 0;
+        var nibbleCount = 0;
+        byte currentByte = 0;
+
+        foreach (var c in bssid)
         {
-            throw new ArgumentException("BSSID must contain 12 hexadecimal characters.", nameof(bssid));
+            if (c == ':' || c == '-') continue;
+
+            var nibble = c switch
+            {
+                >= '0' and <= '9' => c - '0',
+                >= 'A' and <= 'F' => c - 'A' + 10,
+                >= 'a' and <= 'f' => c - 'a' + 10,
+                _ => throw new ArgumentException($"Invalid hex character '{c}' in BSSID.", nameof(bssid))
+            };
+
+            currentByte = (byte)((currentByte << 4) | nibble);
+            if (++nibbleCount == 2)
+            {
+                if (byteIndex >= 6)
+                {
+                    throw new ArgumentException("BSSID must contain exactly 12 hexadecimal characters.", nameof(bssid));
+                }
+                bytes[byteIndex++] = currentByte;
+                currentByte = 0;
+                nibbleCount = 0;
+            }
         }
 
-        var bytes = new byte[6];
-        for (var i = 0; i < 6; i++)
+        if (byteIndex != 6)
         {
-            bytes[i] = Convert.ToByte(normalized.Substring(i * 2, 2), 16);
+            throw new ArgumentException("BSSID must contain exactly 12 hexadecimal characters.", nameof(bssid));
         }
 
         return bytes;
@@ -518,14 +703,18 @@ internal static class WlanNative
 
 #region Native types
 
+// Naming convention:
+// - Native Win32 structs/enums use SCREAMING_SNAKE_CASE (e.g., WLAN_INTERFACE_INFO) to match Windows SDK headers.
+// - Managed wrapper types use PascalCase (e.g., AvailableNetwork, BssEntry).
+
 internal sealed record AvailableNetwork(string SSID, DOT11_BSS_TYPE BssType, uint SignalQuality, bool SecurityEnabled, uint BssCount);
 internal sealed record BssEntry(string Ssid, string Bssid, int Rssi, uint LinkQuality, uint FrequencyKhz, DOT11_BSS_TYPE BssType, DOT11_PHY_TYPE PhyType);
 
 [StructLayout(LayoutKind.Sequential)]
-internal struct WLAN_INTERFACE_INFO_LIST_HEADER
+internal readonly struct WLAN_INTERFACE_INFO_LIST_HEADER
 {
-    public uint dwNumberOfItems;
-    public uint dwIndex;
+    public readonly uint dwNumberOfItems;
+    public readonly uint dwIndex;
 }
 
 [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -599,7 +788,42 @@ internal enum WLAN_NOTIFICATION_ACM
 
 internal enum WLAN_REASON_CODE : uint
 {
-    SUCCESS = 0
+    SUCCESS = 0,
+    // General codes
+    UNKNOWN = 0x00010000,
+    RANGE_SIZE = 0x00010000,
+    BASE = 0x00010000,
+    // AC (Auto Configuration) codes
+    AC_BASE = 0x00020000,
+    AC_CONNECT_REASON_START = 0x00020000,
+    NETWORK_NOT_COMPATIBLE = 0x00020001,
+    PROFILE_NOT_COMPATIBLE = 0x00020002,
+    NO_AUTO_CONNECTION = 0x00020003,
+    NOT_VISIBLE = 0x00020004,
+    GP_DENIED = 0x00020005,
+    USER_DENIED = 0x00020006,
+    BSS_TYPE_NOT_ALLOWED = 0x00020007,
+    IN_FAILED_LIST = 0x00020008,
+    IN_BLOCKED_LIST = 0x00020009,
+    SSID_LIST_TOO_LONG = 0x0002000A,
+    CONNECT_CALL_FAIL = 0x0002000B,
+    SCAN_CALL_FAIL = 0x0002000C,
+    NETWORK_NOT_AVAILABLE = 0x0002000D,
+    PROFILE_CHANGED_OR_DELETED = 0x0002000E,
+    KEY_MISMATCH = 0x0002000F,
+    USER_NOT_RESPOND = 0x00020010,
+    AP_PROFILE_NOT_ALLOWED_FOR_CLIENT = 0x00020011,
+    AP_PROFILE_NOT_ALLOWED = 0x00020012,
+    // MSM (Media Specific Module) codes
+    MSM_BASE = 0x00030000,
+    MSM_CONNECT_REASON_START = 0x00030000,
+    UNSUPPORTED_SECURITY_SET_BY_OS = 0x00030001,
+    UNSUPPORTED_SECURITY_SET = 0x00030002,
+    BSS_TYPE_UNMATCH = 0x00030003,
+    PHY_TYPE_UNMATCH = 0x00030004,
+    DATARATE_UNMATCH = 0x00030005,
+    // 802.1x codes
+    MSMSEC_BASE = 0x00040000
 }
 
 internal enum WLAN_CONNECTION_MODE
@@ -613,26 +837,30 @@ internal enum WLAN_CONNECTION_MODE
 }
 
 [StructLayout(LayoutKind.Sequential)]
-internal struct WLAN_CONNECTION_PARAMETERS
+internal readonly struct WLAN_CONNECTION_PARAMETERS_NATIVE
 {
-    public WLAN_CONNECTION_MODE wlanConnectionMode;
-    [MarshalAs(UnmanagedType.LPWStr)]
-    public string? strProfile;
-    public IntPtr pDot11Ssid;
-    public IntPtr pDesiredBssidList;
-    public DOT11_BSS_TYPE dot11BssType;
-    public uint dwFlags;
-}
+    public readonly WLAN_CONNECTION_MODE wlanConnectionMode;
+    public readonly IntPtr strProfile;
+    public readonly IntPtr pDot11Ssid;
+    public readonly IntPtr pDesiredBssidList;
+    public readonly DOT11_BSS_TYPE dot11BssType;
+    public readonly uint dwFlags;
 
-[StructLayout(LayoutKind.Sequential)]
-internal struct WLAN_CONNECTION_PARAMETERS_NATIVE
-{
-    public WLAN_CONNECTION_MODE wlanConnectionMode;
-    public IntPtr strProfile;
-    public IntPtr pDot11Ssid;
-    public IntPtr pDesiredBssidList;
-    public DOT11_BSS_TYPE dot11BssType;
-    public uint dwFlags;
+    public WLAN_CONNECTION_PARAMETERS_NATIVE(
+        WLAN_CONNECTION_MODE connectionMode,
+        IntPtr profile,
+        IntPtr ssid,
+        IntPtr bssidList,
+        DOT11_BSS_TYPE bssType,
+        uint flags)
+    {
+        wlanConnectionMode = connectionMode;
+        strProfile = profile;
+        pDot11Ssid = ssid;
+        pDesiredBssidList = bssidList;
+        dot11BssType = bssType;
+        dwFlags = flags;
+    }
 }
 
 internal enum DOT11_BSS_TYPE : uint
@@ -643,10 +871,10 @@ internal enum DOT11_BSS_TYPE : uint
 }
 
 [StructLayout(LayoutKind.Sequential)]
-internal struct WLAN_AVAILABLE_NETWORK_LIST_HEADER
+internal readonly struct WLAN_AVAILABLE_NETWORK_LIST_HEADER
 {
-    public uint dwNumberOfItems;
-    public uint dwIndex;
+    public readonly uint dwNumberOfItems;
+    public readonly uint dwIndex;
 }
 
 [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -675,11 +903,17 @@ internal struct WLAN_AVAILABLE_NETWORK
 }
 
 [StructLayout(LayoutKind.Sequential)]
-internal struct DOT11_SSID
+internal readonly struct DOT11_SSID
 {
-    public uint SSIDLength;
+    public readonly uint SSIDLength;
     [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
-    public byte[] SSID;
+    public readonly byte[] SSID;
+
+    public DOT11_SSID(uint length, byte[] ssid)
+    {
+        SSIDLength = length;
+        SSID = ssid;
+    }
 }
 
 [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -696,23 +930,46 @@ internal struct WLAN_CONNECTION_NOTIFICATION_DATA
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
-internal struct NDIS_OBJECT_HEADER
+internal readonly struct NDIS_OBJECT_HEADER
 {
-    public byte Type;
-    public byte Revision;
-    public ushort Size;
+    public readonly byte Type;
+    public readonly byte Revision;
+    public readonly ushort Size;
+
+    public NDIS_OBJECT_HEADER(byte type, byte revision, ushort size)
+    {
+        Type = type;
+        Revision = revision;
+        Size = size;
+    }
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
-internal struct DOT11_MAC_ADDRESS
+internal readonly struct DOT11_MAC_ADDRESS
 {
     [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
-    public byte[] Address;
+    public readonly byte[] Address;
+
+    public DOT11_MAC_ADDRESS(byte[] address)
+    {
+        Address = address;
+    }
 }
 
 internal enum DOT11_PHY_TYPE : uint
 {
     Unknown = 0,
+    Fhss = 1,           // Frequency-hopping spread-spectrum
+    Dsss = 2,           // Direct sequence spread spectrum
+    IrBaseband = 3,     // Infrared baseband
+    Ofdm = 4,           // 802.11a
+    Hrdsss = 5,         // 802.11b
+    Erp = 6,            // 802.11g
+    Ht = 7,             // 802.11n (Wi-Fi 4)
+    Vht = 8,            // 802.11ac (Wi-Fi 5)
+    Dmg = 9,            // 802.11ad (60 GHz)
+    He = 10,            // 802.11ax (Wi-Fi 6)
+    Eht = 11,           // 802.11be (Wi-Fi 7)
     Any = 0xFFFFFFFF
 }
 
@@ -753,10 +1010,10 @@ internal enum DOT11_CIPHER_ALGORITHM : uint
 }
 
 [StructLayout(LayoutKind.Sequential)]
-internal struct WLAN_BSS_LIST_HEADER
+internal readonly struct WLAN_BSS_LIST_HEADER
 {
-    public uint dwTotalSize;
-    public uint dwNumberOfItems;
+    public readonly uint dwTotalSize;
+    public readonly uint dwNumberOfItems;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -789,7 +1046,7 @@ internal struct WLAN_RATE_SET
     public ushort[] ucRateSet;
 }
 
-[StructLayout(LayoutKind.Sequential, Pack = 1)]
+[StructLayout(LayoutKind.Sequential)]
 internal struct DOT11_BSSID_ENTRY
 {
     public DOT11_MAC_ADDRESS Bssid;
@@ -808,7 +1065,7 @@ internal struct DOT11_BSSID_ENTRY
     public byte[] Reserved;
 }
 
-[StructLayout(LayoutKind.Sequential, Pack = 1)]
+[StructLayout(LayoutKind.Sequential)]
 internal struct DOT11_BSSID_LIST
 {
     public NDIS_OBJECT_HEADER Header;
@@ -816,5 +1073,74 @@ internal struct DOT11_BSSID_LIST
     public uint TotalNumOfEntries;
     public DOT11_BSSID_ENTRY BssidEntry;
 }
+
+internal enum WLAN_INTF_OPCODE : uint
+{
+    AutoconfStart = 0x00000000,
+    AutoconfEnabled,
+    BackgroundScanEnabled,
+    MediaStreamingMode,
+    RadioState,
+    BssType,
+    InterfaceState,
+    CurrentConnection,
+    ChannelNumber,
+    SupportedInfrastructureAuthCipherPairs,
+    SupportedAdhocAuthCipherPairs,
+    SupportedCountryOrRegionStringList,
+    CurrentOperationMode,
+    SupportedSafeMode,
+    CertifiedSafeMode,
+    HostedNetworkCapable,
+    ManagementFrameProtectionCapable,
+    SecondaryStaInterfaces,
+    SecondaryStaSynchronizedConnections,
+    AutoconfEnd = 0x0FFFFFFF
+}
+
+internal enum WLAN_OPCODE_VALUE_TYPE
+{
+    QueryOnly = 0,
+    SetByGroupPolicy = 1,
+    SetByUser = 2,
+    Invalid = 3
+}
+
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+internal struct WLAN_CONNECTION_ATTRIBUTES
+{
+    public WLAN_INTERFACE_STATE isState;
+    public WLAN_CONNECTION_MODE wlanConnectionMode;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+    public string strProfileName;
+    public WLAN_ASSOCIATION_ATTRIBUTES wlanAssociationAttributes;
+    public WLAN_SECURITY_ATTRIBUTES wlanSecurityAttributes;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct WLAN_ASSOCIATION_ATTRIBUTES
+{
+    public DOT11_SSID dot11Ssid;
+    public DOT11_BSS_TYPE dot11BssType;
+    public DOT11_MAC_ADDRESS dot11Bssid;
+    public DOT11_PHY_TYPE dot11PhyType;
+    public uint uDot11PhyIndex;
+    public uint wlanSignalQuality;
+    public uint ulRxRate;
+    public uint ulTxRate;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct WLAN_SECURITY_ATTRIBUTES
+{
+    [MarshalAs(UnmanagedType.Bool)]
+    public bool bSecurityEnabled;
+    [MarshalAs(UnmanagedType.Bool)]
+    public bool bOneXEnabled;
+    public DOT11_AUTH_ALGORITHM dot11AuthAlgorithm;
+    public DOT11_CIPHER_ALGORITHM dot11CipherAlgorithm;
+}
+
+internal sealed record CurrentConnectionInfo(bool IsConnected, string? Ssid, string? Bssid, uint SignalQuality);
 
 #endregion

@@ -6,8 +6,14 @@ using System.Net.NetworkInformation;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-internal class Program
+internal static class Logger
 {
+	public static void Log(string message) => Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}");
+}
+
+internal sealed class Program
+{
+
 	private static async Task<int> Main(string[] args)
 	{
 		using var cts = new CancellationTokenSource();
@@ -118,7 +124,7 @@ internal class Program
 		var showCommand = new Command("show", "Show WLAN information.");
 		var showInterfaceCommand = new Command("interface", "List available Wi-Fi interfaces.");
 
-		showInterfaceCommand.SetAction((_, cancellationToken) => RunShowInterfaceAsync(cancellationToken));
+		showInterfaceCommand.SetAction((_, _) => Task.FromResult(RunShowInterface()));
 		showCommand.Subcommands.Add(showInterfaceCommand);
 		rootCommand.Subcommands.Add(showCommand);
 
@@ -134,57 +140,132 @@ internal class Program
 		}
 		catch (Exception ex) when (ex is ArgumentException or FileNotFoundException or JsonException)
 		{
-			Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Configuration error: {ex.Message}");
+			Logger.Log($"Configuration error: {ex.Message}");
 			return 1;
 		}
 
 		using var wlan = new WlanClient();
 		if (!TryResolveInterface(wlan, options.Interface, out var selectedInterface, out var error))
 		{
-			Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] {error}");
+			Logger.Log(error!);
 			return 1;
 		}
 
-		Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Using interface: {selectedInterface.strInterfaceDescription} (State: {selectedInterface.isState}, GUID: {selectedInterface.InterfaceGuid}).");
-		Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Monitoring gateway {config.Gateway} every {config.Interval}s for SSID '{config.SSID}' (BSSID: {config.BSSID ?? "any"}). Press Ctrl+C to exit.");
+		Logger.Log($"Using interface: {selectedInterface.strInterfaceDescription} (State: {selectedInterface.isState}, GUID: {selectedInterface.InterfaceGuid}).");
+
+		var useGatewayMode = !string.IsNullOrWhiteSpace(config.Gateway);
+		if (useGatewayMode)
+		{
+			Logger.Log($"Gateway mode: Monitoring gateway {config.Gateway} every {config.Interval}s for SSID '{config.SSID}'. Press Ctrl+C to exit.");
+		}
+		else
+		{
+			Logger.Log($"BSSID mode: Monitoring connection to SSID '{config.SSID}' (BSSID: {config.BSSID}) every {config.Interval}s. Press Ctrl+C to exit.");
+		}
 
 		DateTime? successStart = null;
 		DateTime? lastSuccess = null;
+		int consecutiveFailures = 0;
+		const int maxBackoffSeconds = 60;
+		const int maxConsecutiveFailures = 10;
 
 		while (!cancellationToken.IsCancellationRequested)
 		{
-			var reachable = await NetworkHelper.PingAsync(config.Gateway, TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
-			if (reachable)
+			bool shouldReconnect;
+			string? disconnectReason = null;
+
+			if (useGatewayMode)
+			{
+				// Gateway mode: ping to check connectivity
+				var reachable = await NetworkHelper.PingAsync(config.Gateway!, TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
+				shouldReconnect = !reachable;
+				if (shouldReconnect)
+				{
+					disconnectReason = "Gateway unreachable";
+				}
+			}
+			else
+			{
+				// BSSID mode: check current connection info
+				try
+				{
+					var connInfo = wlan.GetCurrentConnection(selectedInterface.InterfaceGuid);
+					if (!connInfo.IsConnected)
+					{
+						shouldReconnect = true;
+						disconnectReason = "Not connected to any network";
+					}
+					else if (!string.Equals(connInfo.Ssid, config.SSID, StringComparison.Ordinal))
+					{
+						shouldReconnect = true;
+						disconnectReason = $"Connected to different SSID: '{connInfo.Ssid}' (expected: '{config.SSID}')";
+					}
+					else if (!NetworkHelper.BssidEquals(connInfo.Bssid, config.BSSID))
+					{
+						shouldReconnect = true;
+						disconnectReason = $"Connected to different BSSID: '{connInfo.Bssid}' (expected: '{config.BSSID}')";
+					}
+					else
+					{
+						shouldReconnect = false;
+					}
+				}
+				catch (Win32Exception ex)
+				{
+					Logger.Log($"Failed to query connection info: {ex.Message}");
+					shouldReconnect = true;
+					disconnectReason = "Failed to query connection info";
+				}
+			}
+
+			if (!shouldReconnect)
 			{
 				var now = DateTime.Now;
 				successStart ??= now;
 				lastSuccess = now;
+				consecutiveFailures = 0;
 			}
 			else
 			{
 				if (successStart.HasValue && lastSuccess.HasValue)
 				{
-					Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Gateway connectivity was healthy from {successStart:yyyyMMdd HH:mm:ss} to {lastSuccess:yyyyMMdd HH:mm:ss}.");
+					Logger.Log($"Connection was healthy from {successStart:yyyy-MM-dd HH:mm:ss.fff} to {lastSuccess:yyyy-MM-dd HH:mm:ss.fff}.");
 					successStart = null;
 					lastSuccess = null;
 				}
 
-				Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Gateway unreachable. Reconnecting...");
+				Logger.Log($"{disconnectReason}. Reconnecting...");
 				try
 				{
 					await wlan.ConnectAsync(selectedInterface.InterfaceGuid, config.SSID, config.BSSID, cancellationToken).ConfigureAwait(false);
 				}
 				catch (Win32Exception ex)
 				{
-					Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Reconnect failed with Win32 error {ex.NativeErrorCode}: {ex.Message}");
+					Logger.Log($"Reconnect failed with Win32 error {ex.NativeErrorCode}: {ex.Message}");
 				}
 				catch (Exception ex)
 				{
-					Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Reconnect failed: {ex.Message}\r\n{ex.StackTrace}");
+					Logger.Log($"Reconnect failed: {ex}");
+				}
+
+				consecutiveFailures++;
+
+				if (consecutiveFailures >= maxConsecutiveFailures)
+				{
+					Logger.Log($"Reached maximum consecutive failures ({maxConsecutiveFailures}). Resetting failure count and continuing...");
+					consecutiveFailures = 0;
 				}
 			}
 
-			await Task.Delay(TimeSpan.FromSeconds(config.Interval), cancellationToken).ConfigureAwait(false);
+			// Calculate wait time with exponential backoff on failures (capped to prevent overflow)
+			var cappedFailures = Math.Min(consecutiveFailures, 6); // 2^6 = 64, prevents overflow
+			var backoffMultiplier = cappedFailures > 0 ? 1 << (cappedFailures - 1) : 1;
+			var waitSeconds = Math.Min(config.Interval * backoffMultiplier, maxBackoffSeconds);
+			if (consecutiveFailures > 0)
+			{
+				Logger.Log($"Waiting {waitSeconds} seconds before next check (backoff due to {consecutiveFailures} consecutive failure(s))...");
+			}
+			await Task.Delay(TimeSpan.FromSeconds(waitSeconds), cancellationToken).ConfigureAwait(false);
 		}
 
 		return 0;
@@ -195,12 +276,12 @@ internal class Program
 		using var wlan = new WlanClient();
 		if (!TryResolveInterface(wlan, options.Interface, out var selectedInterface, out var error))
 		{
-			Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] {error}");
+			Logger.Log(error!);
 			return 1;
 		}
 
-		Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Using interface: {selectedInterface.strInterfaceDescription} (State: {selectedInterface.isState}, GUID: {selectedInterface.InterfaceGuid}).");
-		Console.WriteLine(options.Mode == ScanMode.Bssid ? $"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Scanning for BSS entries..." : $"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Scanning for available Wi-Fi networks...");
+		Logger.Log($"Using interface: {selectedInterface.strInterfaceDescription} (State: {selectedInterface.isState}, GUID: {selectedInterface.InterfaceGuid}).");
+		Logger.Log(options.Mode == ScanMode.Bssid ? "Scanning for BSS entries..." : "Scanning for available Wi-Fi networks...");
 
 		try
 		{
@@ -209,7 +290,7 @@ internal class Program
 				var bssList = await wlan.ScanBssAsync(selectedInterface.InterfaceGuid, cancellationToken).ConfigureAwait(false);
 				if (bssList.Count == 0)
 				{
-					Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] No BSS entries found.");
+					Logger.Log("No BSS entries found.");
 					return 0;
 				}
 
@@ -227,7 +308,7 @@ internal class Program
 				var networks = await wlan.ScanAsync(selectedInterface.InterfaceGuid, cancellationToken).ConfigureAwait(false);
 				if (networks.Count == 0)
 				{
-					Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] No networks found.");
+					Logger.Log("No networks found.");
 					return 0;
 				}
 
@@ -258,26 +339,26 @@ internal class Program
 		}
 		catch (Win32Exception ex)
 		{
-			Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Scan failed with Win32 error {ex.NativeErrorCode}: {ex.Message}");
+			Logger.Log($"Scan failed with Win32 error {ex.NativeErrorCode}: {ex.Message}");
 			return 1;
 		}
 		catch (Exception ex)
 		{
-			Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] Scan failed: {ex.Message}");
+			Logger.Log($"Scan failed: {ex}");
 			return 1;
 		}
 
 		return 0;
 	}
 
-	private static Task<int> RunShowInterfaceAsync(CancellationToken cancellationToken)
+	private static int RunShowInterface()
 	{
 		using var wlan = new WlanClient();
 		var interfaces = wlan.GetInterfaces();
 		if (interfaces.Count == 0)
 		{
-			Console.WriteLine($"[{DateTime.Now:yyyyMMdd HH:mm:ss}] No Wi-Fi interfaces found.");
-			return Task.FromResult(1);
+			Logger.Log("No Wi-Fi interfaces found.");
+			return 1;
 		}
 
 		for (var i = 0; i < interfaces.Count; i++)
@@ -286,7 +367,7 @@ internal class Program
 			Console.WriteLine($"{i + 1}. {iface.strInterfaceDescription} (State: {iface.isState}, GUID: {iface.InterfaceGuid})");
 		}
 
-		return Task.FromResult(0);
+		return 0;
 	}
 
 	private static bool TryResolveInterface(WlanClient wlan, string? selector, out WLAN_INTERFACE_INFO selected, out string? error)
@@ -310,9 +391,9 @@ internal class Program
 		var matches = interfaces
 			.Where(i => i.InterfaceGuid.ToString().Equals(trimmed, StringComparison.OrdinalIgnoreCase)
 					|| i.strInterfaceDescription.Contains(trimmed, StringComparison.OrdinalIgnoreCase))
-			.ToList();
+			.ToArray();
 
-		if (matches.Count == 1)
+		if (matches.Length == 1)
 		{
 			selected = matches[0];
 			error = null;
@@ -320,7 +401,7 @@ internal class Program
 		}
 
 		selected = default;
-		if (matches.Count > 1)
+		if (matches.Length > 1)
 		{
 			error = $"Multiple interfaces matched '{selector}'. Please specify the full GUID or a more specific name.";
 		}
@@ -355,7 +436,7 @@ internal enum ScanMode
 	Bssid
 }
 
-internal sealed record AppConfig(string SSID, string? BSSID, string Gateway, int Interval)
+internal sealed record AppConfig(string SSID, string? BSSID, string? Gateway, int Interval)
 {
 	public static async Task<AppConfig> BuildAsync(ConnectOptions options, CancellationToken cancellationToken)
 	{
@@ -382,9 +463,27 @@ internal sealed record AppConfig(string SSID, string? BSSID, string Gateway, int
 			throw new ArgumentException("SSID is required.");
 		}
 
-		if (string.IsNullOrWhiteSpace(gateway))
+		var hasGateway = !string.IsNullOrWhiteSpace(gateway);
+		var hasBssid = !string.IsNullOrWhiteSpace(bssid);
+
+		if (hasGateway && !System.Net.IPAddress.TryParse(gateway, out _))
 		{
-			throw new ArgumentException("Gateway is required.");
+			throw new ArgumentException($"Invalid gateway IP address format: {gateway}");
+		}
+
+		if (hasBssid && !NetworkHelper.IsValidBssid(bssid!))
+		{
+			throw new ArgumentException($"Invalid BSSID format: {bssid}. Expected format: XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX");
+		}
+
+		if (hasGateway && hasBssid)
+		{
+			throw new ArgumentException("Gateway and BSSID cannot both be specified. Please choose one mode.");
+		}
+
+		if (!hasGateway && !hasBssid)
+		{
+			throw new ArgumentException("Either Gateway or BSSID must be specified.");
 		}
 
 		if (interval <= 0)
@@ -415,56 +514,116 @@ internal sealed class ConfigFilePayload
 
 internal static class NetworkHelper
 {
+	/// <summary>
+	/// Validates whether a string is a valid BSSID (MAC address) format.
+	/// Accepts formats: XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX
+	/// </summary>
+	public static bool IsValidBssid(ReadOnlySpan<char> bssid)
+	{
+		var hexCount = 0;
+		foreach (var c in bssid)
+		{
+			if (c == ':' || c == '-')
+			{
+				continue;
+			}
+
+			if (!char.IsAsciiHexDigit(c))
+			{
+				return false;
+			}
+
+			hexCount++;
+		}
+
+		return hexCount == 12;
+	}
+
 	public static async Task<bool> PingAsync(string host, TimeSpan timeout, CancellationToken cancellationToken)
 	{
 		using var ping = new Ping();
 		try
 		{
-			// WaitAsync(timeout, cancellationToken)
-			var reply = await ping.SendPingAsync(host, (int)timeout.TotalMilliseconds).ConfigureAwait(false);
+			// SendPingAsync handles the timeout internally; WaitAsync is only for cancellation support
+			var pingTask = ping.SendPingAsync(host, (int)timeout.TotalMilliseconds);
+			var reply = await pingTask.WaitAsync(cancellationToken).ConfigureAwait(false);
 			return reply.Status == IPStatus.Success;
 		}
 		catch (PingException)
 		{
 			return false;
 		}
-		catch (TimeoutException)
+		catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+		{
+			// Timeout only, not user cancellation
+			return false;
+		}
+		// Let user cancellation propagate
+	}
+
+	/// <summary>
+	/// Compares two BSSID strings, ignoring separator differences (colon vs dash).
+	/// </summary>
+	public static bool BssidEquals(string? bssid1, string? bssid2)
+	{
+		if (bssid1 is null && bssid2 is null)
+		{
+			return true;
+		}
+
+		if (bssid1 is null || bssid2 is null)
 		{
 			return false;
 		}
+
+		// Use Span<char> to avoid string allocations
+		Span<char> buffer1 = stackalloc char[12];
+		Span<char> buffer2 = stackalloc char[12];
+
+		if (!TryNormalizeBssid(bssid1, buffer1) || !TryNormalizeBssid(bssid2, buffer2))
+		{
+			return false;
+		}
+
+		return buffer1.SequenceEqual(buffer2);
+	}
+
+	private static bool TryNormalizeBssid(ReadOnlySpan<char> bssid, Span<char> destination)
+	{
+		if (destination.Length < 12)
+		{
+			return false;
+		}
+
+		var destIndex = 0;
+		foreach (var c in bssid)
+		{
+			if (c == ':' || c == '-')
+			{
+				continue;
+			}
+
+			if (destIndex >= 12)
+			{
+				return false;
+			}
+
+			destination[destIndex++] = char.ToUpperInvariant(c);
+		}
+
+		return destIndex == 12;
 	}
 }
 
 internal static class ScanHelpers
 {
-	public static string? GetBand(uint frequencyKhz)
+	public static string? GetBand(uint frequencyKhz) => (frequencyKhz / 1000.0) switch
 	{
-		if (frequencyKhz == 0)
-		{
-			return null;
-		}
-
-		var mhz = frequencyKhz / 1000.0;
-		if (mhz >= 2400 && mhz <= 2500)
-		{
-			return "2.4 GHz";
-		}
-
-		if (mhz >= 4900 && mhz <= 5925)
-		{
-			return "5 GHz";
-		}
-
-		if (mhz >= 5925 && mhz <= 7125)
-		{
-			return "6 GHz";
-		}
-
-		if (mhz >= 57000 && mhz <= 71000)
-		{
-			return "60 GHz";
-		}
-
-		return null;
-	}
+		0 => null,
+		>= 2400 and <= 2500 => "2.4 GHz",
+		>= 4900 and < 5925 => "5 GHz",
+		>= 5925 and <= 7125 => "6 GHz",
+		>= 57000 and <= 71000 => "60 GHz",
+		_ => null
+	};
 }
