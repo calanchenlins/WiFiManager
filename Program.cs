@@ -13,6 +13,10 @@ internal static class Logger
 
 internal sealed class Program
 {
+	private const int MaxBackoffSeconds = 60;
+	private const int MaxConsecutiveFailures = 10;
+	private const int MaxBackoffExponent = 6; // 2^6 = 64, prevents overflow
+	private const double JitterFactor = 0.25;
 
 	private static async Task<int> Main(string[] args)
 	{
@@ -161,62 +165,18 @@ internal sealed class Program
 		else
 		{
 			Logger.Log($"BSSID mode: Monitoring connection to SSID '{config.SSID}' (BSSID: {config.BSSID}) every {config.Interval}s. Press Ctrl+C to exit.");
+			Logger.Log("WARNING: Windows WLAN AutoConfig may automatically roam to a different BSSID with stronger signal.");
+			Logger.Log("         If you experience frequent reconnections, consider disabling auto-connect for this network profile.");
 		}
 
 		DateTime? successStart = null;
 		DateTime? lastSuccess = null;
 		int consecutiveFailures = 0;
-		const int maxBackoffSeconds = 60;
-		const int maxConsecutiveFailures = 10;
 
 		while (!cancellationToken.IsCancellationRequested)
 		{
-			bool shouldReconnect;
-			string? disconnectReason = null;
-
-			if (useGatewayMode)
-			{
-				// Gateway mode: ping to check connectivity
-				var reachable = await NetworkHelper.PingAsync(config.Gateway!, TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
-				shouldReconnect = !reachable;
-				if (shouldReconnect)
-				{
-					disconnectReason = "Gateway unreachable";
-				}
-			}
-			else
-			{
-				// BSSID mode: check current connection info
-				try
-				{
-					var connInfo = wlan.GetCurrentConnection(selectedInterface.InterfaceGuid);
-					if (!connInfo.IsConnected)
-					{
-						shouldReconnect = true;
-						disconnectReason = "Not connected to any network";
-					}
-					else if (!string.Equals(connInfo.Ssid, config.SSID, StringComparison.Ordinal))
-					{
-						shouldReconnect = true;
-						disconnectReason = $"Connected to different SSID: '{connInfo.Ssid}' (expected: '{config.SSID}')";
-					}
-					else if (!NetworkHelper.BssidEquals(connInfo.Bssid, config.BSSID))
-					{
-						shouldReconnect = true;
-						disconnectReason = $"Connected to different BSSID: '{connInfo.Bssid}' (expected: '{config.BSSID}')";
-					}
-					else
-					{
-						shouldReconnect = false;
-					}
-				}
-				catch (Win32Exception ex)
-				{
-					Logger.Log($"Failed to query connection info: {ex.Message}");
-					shouldReconnect = true;
-					disconnectReason = "Failed to query connection info";
-				}
-			}
+			var (shouldReconnect, disconnectReason) = await CheckConnectivityAsync(
+				wlan, selectedInterface.InterfaceGuid, config, useGatewayMode, cancellationToken).ConfigureAwait(false);
 
 			if (!shouldReconnect)
 			{
@@ -250,20 +210,17 @@ internal sealed class Program
 
 				consecutiveFailures++;
 
-				if (consecutiveFailures >= maxConsecutiveFailures)
+				if (consecutiveFailures >= MaxConsecutiveFailures)
 				{
-					Logger.Log($"Reached maximum consecutive failures ({maxConsecutiveFailures}). Resetting failure count and continuing...");
+					Logger.Log($"Reached maximum consecutive failures ({MaxConsecutiveFailures}). Resetting failure count and continuing...");
 					consecutiveFailures = 0;
 				}
 			}
 
-			// Calculate wait time with exponential backoff on failures (capped to prevent overflow)
-			var cappedFailures = Math.Min(consecutiveFailures, 6); // 2^6 = 64, prevents overflow
-			var backoffMultiplier = cappedFailures > 0 ? 1 << (cappedFailures - 1) : 1;
-			var waitSeconds = Math.Min(config.Interval * backoffMultiplier, maxBackoffSeconds);
+			var waitSeconds = CalculateWaitSeconds(config.Interval, consecutiveFailures);
 			if (consecutiveFailures > 0)
 			{
-				Logger.Log($"Waiting {waitSeconds} seconds before next check (backoff due to {consecutiveFailures} consecutive failure(s))...");
+				Logger.Log($"Waiting {waitSeconds} seconds before next check (backoff due to {consecutiveFailures} consecutive failure(s), jitter applied)...");
 			}
 			await Task.Delay(TimeSpan.FromSeconds(waitSeconds), cancellationToken).ConfigureAwait(false);
 		}
@@ -324,7 +281,9 @@ internal sealed class Program
 							strongest.BssType,
 							strongest.SignalQuality,
 							strongest.SecurityEnabled,
-							BssCount = (uint)totalBssids
+							BssCount = (uint)totalBssids,
+							strongest.AuthAlgorithm,
+							strongest.CipherAlgorithm
 						};
 					})
 					.OrderByDescending(n => n.SignalQuality)
@@ -333,7 +292,10 @@ internal sealed class Program
 				for (var i = 0; i < grouped.Count; i++)
 				{
 					var n = grouped[i];
-					Console.WriteLine($"{i + 1}. SSID: {n.SSID}, Signal: {n.SignalQuality}%, Security: {(n.SecurityEnabled ? "On" : "Off")}, BSSIDs: {n.BssCount}, Type: {n.BssType}");
+					var authStr = ScanHelpers.GetAuthAlgorithmName(n.AuthAlgorithm);
+					var cipherStr = ScanHelpers.GetCipherAlgorithmName(n.CipherAlgorithm);
+					var securityInfo = n.SecurityEnabled ? $"{authStr}/{cipherStr}" : "Open";
+					Console.WriteLine($"{i + 1}. SSID: {n.SSID}, Signal: {n.SignalQuality}%, Security: {securityInfo}, BSSIDs: {n.BssCount}, Type: {n.BssType}");
 				}
 			}
 		}
@@ -411,6 +373,71 @@ internal sealed class Program
 		}
 
 		return false;
+	}
+
+	/// <summary>
+	/// Checks current connectivity status and determines if reconnection is needed.
+	/// </summary>
+	/// <returns>A tuple indicating whether to reconnect and the reason for disconnection.</returns>
+	private static async Task<(bool ShouldReconnect, string? Reason)> CheckConnectivityAsync(
+		WlanClient wlan,
+		Guid interfaceId,
+		AppConfig config,
+		bool useGatewayMode,
+		CancellationToken cancellationToken)
+	{
+		if (useGatewayMode)
+		{
+			// Gateway mode: ping to check connectivity
+			var reachable = await NetworkHelper.PingAsync(config.Gateway!, TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
+			return reachable ? (false, null) : (true, "Gateway unreachable");
+		}
+
+		// BSSID mode: check current connection info
+		try
+		{
+			var connInfo = wlan.GetCurrentConnection(interfaceId);
+			if (!connInfo.IsConnected)
+			{
+				return (true, "Not connected to any network");
+			}
+
+			if (!string.Equals(connInfo.Ssid, config.SSID, StringComparison.Ordinal))
+			{
+				return (true, $"Connected to different SSID: '{connInfo.Ssid}' (expected: '{config.SSID}')");
+			}
+
+			if (!NetworkHelper.BssidEquals(connInfo.Bssid, config.BSSID))
+			{
+				return (true, $"Connected to different BSSID: '{connInfo.Bssid}' (expected: '{config.BSSID}')");
+			}
+
+			return (false, null);
+		}
+		catch (Win32Exception ex)
+		{
+			Logger.Log($"Failed to query connection info: {ex.Message}");
+			return (true, "Failed to query connection info");
+		}
+	}
+
+	/// <summary>
+	/// Calculates wait time with exponential backoff and jitter.
+	/// </summary>
+	/// <param name="baseInterval">Base interval in seconds.</param>
+	/// <param name="consecutiveFailures">Number of consecutive failures.</param>
+	/// <returns>Wait time in seconds.</returns>
+	private static int CalculateWaitSeconds(int baseInterval, int consecutiveFailures)
+	{
+		// Calculate wait time with exponential backoff on failures (capped to prevent overflow)
+		var cappedFailures = Math.Min(consecutiveFailures, MaxBackoffExponent);
+		var backoffMultiplier = cappedFailures > 0 ? 1 << (cappedFailures - 1) : 1;
+		var baseWaitSeconds = Math.Min(baseInterval * backoffMultiplier, MaxBackoffSeconds);
+
+		// Add jitter (±25%) to prevent thundering herd when multiple devices reconnect simultaneously
+		var jitterRange = (int)(baseWaitSeconds * JitterFactor);
+		var jitter = jitterRange > 0 ? Random.Shared.Next(-jitterRange, jitterRange + 1) : 0;
+		return Math.Max(1, baseWaitSeconds + jitter);
 	}
 }
 
@@ -625,5 +652,39 @@ internal static class ScanHelpers
 		>= 5925 and <= 7125 => "6 GHz",
 		>= 57000 and <= 71000 => "60 GHz",
 		_ => null
+	};
+
+	public static string GetAuthAlgorithmName(DOT11_AUTH_ALGORITHM algorithm) => algorithm switch
+	{
+		DOT11_AUTH_ALGORITHM.IEEE80211_Open => "Open",
+		DOT11_AUTH_ALGORITHM.IEEE80211_SharedKey => "WEP-Shared",
+		DOT11_AUTH_ALGORITHM.WPA => "WPA-Enterprise",
+		DOT11_AUTH_ALGORITHM.WPA_PSK => "WPA-Personal",
+		DOT11_AUTH_ALGORITHM.WPA_None => "WPA-None",
+		DOT11_AUTH_ALGORITHM.RSNA => "WPA2-Enterprise",
+		DOT11_AUTH_ALGORITHM.RSNA_PSK => "WPA2-Personal",
+		DOT11_AUTH_ALGORITHM.WPA3 => "WPA3",
+		DOT11_AUTH_ALGORITHM.WPA3_SAE => "WPA3-Personal",
+		DOT11_AUTH_ALGORITHM.OWE => "OWE",
+		DOT11_AUTH_ALGORITHM.WPA3_ENT => "WPA3-Enterprise",
+		DOT11_AUTH_ALGORITHM.WPA3_ENT_192 => "WPA3-Enterprise-192",
+		_ => algorithm.ToString()
+	};
+
+	public static string GetCipherAlgorithmName(DOT11_CIPHER_ALGORITHM algorithm) => algorithm switch
+	{
+		DOT11_CIPHER_ALGORITHM.None => "None",
+		DOT11_CIPHER_ALGORITHM.WEP40 => "WEP40",
+		DOT11_CIPHER_ALGORITHM.WEP104 => "WEP104",
+		DOT11_CIPHER_ALGORITHM.WEP => "WEP",
+		DOT11_CIPHER_ALGORITHM.TKIP => "TKIP",
+		DOT11_CIPHER_ALGORITHM.CCMP => "CCMP",
+		DOT11_CIPHER_ALGORITHM.GCMP => "GCMP",
+		DOT11_CIPHER_ALGORITHM.GCMP_256 => "GCMP-256",
+		DOT11_CIPHER_ALGORITHM.BIP => "BIP",
+		DOT11_CIPHER_ALGORITHM.BIP_GMAC_128 => "BIP-GMAC-128",
+		DOT11_CIPHER_ALGORITHM.BIP_GMAC_256 => "BIP-GMAC-256",
+		DOT11_CIPHER_ALGORITHM.BIP_CMAC_256 => "BIP-CMAC-256",
+		_ => algorithm.ToString()
 	};
 }

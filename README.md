@@ -94,6 +94,32 @@ WiFiManager.exe scan --mode bssid --interface "Intel(R) Wi-Fi"
 *   `-m, --mode`: Scan mode. `network` (default) or `bssid`.
 *   `-n, --interface`: (Optional) Target Wi-Fi interface (GUID or name substring). Defaults to the first interface.
 
+**Example Output (Network Mode):**
+
+```
+1. SSID: MyHomeWiFi, Signal: 92%, Security: WPA2-Personal/CCMP, BSSIDs: 2, Type: Infrastructure
+2. SSID: Office_5G, Signal: 78%, Security: WPA3-Personal/GCMP, BSSIDs: 1, Type: Infrastructure
+3. SSID: Guest_Network, Signal: 65%, Security: Open, BSSIDs: 1, Type: Infrastructure
+```
+
+**Example Output (BSSID Mode):**
+
+```
+1. BSSID: AA:BB:CC:DD:EE:F1, SSID: MyHomeWiFi, RSSI: -45 dBm, LinkQuality: 92%, Freq: 5180.0 MHz (5 GHz), Type: Infrastructure, PHY: He
+2. BSSID: AA:BB:CC:DD:EE:F2, SSID: MyHomeWiFi, RSSI: -52 dBm, LinkQuality: 85%, Freq: 2437.0 MHz (2.4 GHz), Type: Infrastructure, PHY: Ht
+3. BSSID: 11:22:33:44:55:66, SSID: Office_5G, RSSI: -58 dBm, LinkQuality: 78%, Freq: 5745.0 MHz (5 GHz), Type: Infrastructure, PHY: Vht
+```
+
+**Field Descriptions:**
+
+| Field | Description |
+|-------|-------------|
+| Signal / LinkQuality | Signal strength percentage (0-100%) |
+| RSSI | Received Signal Strength Indicator in dBm (typically -30 to -90, higher is better) |
+| Security | Authentication/Cipher algorithms (e.g., WPA2-Personal/CCMP, WPA3-Personal/GCMP) |
+| PHY | Physical layer type: Ht (Wi-Fi 4), Vht (Wi-Fi 5), He (Wi-Fi 6), Eht (Wi-Fi 7) |
+| Freq/Band | Channel frequency in MHz and band (2.4 GHz, 5 GHz, 6 GHz) |
+
 ### 3. Show Interfaces
 
 List all Wi-Fi interfaces and their states:
@@ -161,6 +187,27 @@ The executable will be in `bin/Release/net8.0/win-x64/publish/`.
 | `The network is not available` | Target SSID not in range or hidden | Move closer to AP, or ensure SSID is broadcasting |
 | Connection drops repeatedly | Weak signal or interference | Use `scan --mode bssid` to check signal strength; consider BSSID lock to prevent roaming |
 | Service fails to connect | SYSTEM account cannot access user Wi-Fi profiles | Export the profile as "All Users" using `netsh wlan export profile folder=. key=clear` and re-import |
+| BSSID mode frequent reconnections | Windows WLAN AutoConfig automatic roaming | See [BSSID Mode and AutoConfig Conflict](#bssid-mode-and-autoconfig-conflict) below |
+
+### BSSID Mode and AutoConfig Conflict
+
+> ⚠️ **Important**: In BSSID mode, Windows WLAN AutoConfig service may automatically roam to a different access point (BSSID) with a stronger signal, even when you've specified a target BSSID. This can cause a loop where:
+>
+> 1. WiFiManager connects to your specified BSSID
+> 2. AutoConfig detects a stronger AP and roams automatically
+> 3. WiFiManager detects the BSSID change and reconnects
+> 4. Repeat...
+
+**Solutions:**
+
+1. **Disable auto-connect for the network profile:**
+   ```powershell
+   netsh wlan set profileparameter name="YourSSID" connectionmode=manual
+   ```
+
+2. **Use Gateway mode instead** if you only need to ensure connectivity (not lock to a specific AP).
+
+3. **Adjust signal environment** to ensure the target AP has the strongest signal.
 
 **Useful diagnostic commands:**
 
@@ -173,6 +220,15 @@ netsh wlan show profile name="MyWiFi" key=clear
 
 # Check current connection status
 netsh wlan show interfaces
+
+# Check AutoConfig status
+netsh wlan show settings
+
+# Disable AutoConfig for an interface (requires admin)
+netsh wlan set autoconfig enabled=no interface="Wi-Fi"
+
+# Enable AutoConfig for an interface
+netsh wlan set autoconfig enabled=yes interface="Wi-Fi"
 ```
 
 ## Exit Codes
@@ -329,6 +385,32 @@ WiFiManager.exe scan --mode bssid --interface "Intel(R) Wi-Fi"
 *   `-m, --mode`: 扫描模式。`network` (默认，按网络汇总) 或 `bssid` (列出所有物理接入点)。
 *   `-n, --interface`: (选填) 目标 Wi-Fi 网卡（GUID 或名称关键字）。默认使用首个无线网卡。
 
+**输出示例 (Network 模式)：**
+
+```
+1. SSID: MyHomeWiFi, Signal: 92%, Security: WPA2-Personal/CCMP, BSSIDs: 2, Type: Infrastructure
+2. SSID: Office_5G, Signal: 78%, Security: WPA3-Personal/GCMP, BSSIDs: 1, Type: Infrastructure
+3. SSID: Guest_Network, Signal: 65%, Security: Open, BSSIDs: 1, Type: Infrastructure
+```
+
+**输出示例 (BSSID 模式)：**
+
+```
+1. BSSID: AA:BB:CC:DD:EE:F1, SSID: MyHomeWiFi, RSSI: -45 dBm, LinkQuality: 92%, Freq: 5180.0 MHz (5 GHz), Type: Infrastructure, PHY: He
+2. BSSID: AA:BB:CC:DD:EE:F2, SSID: MyHomeWiFi, RSSI: -52 dBm, LinkQuality: 85%, Freq: 2437.0 MHz (2.4 GHz), Type: Infrastructure, PHY: Ht
+3. BSSID: 11:22:33:44:55:66, SSID: Office_5G, RSSI: -58 dBm, LinkQuality: 78%, Freq: 5745.0 MHz (5 GHz), Type: Infrastructure, PHY: Vht
+```
+
+**字段说明：**
+
+| 字段 | 说明 |
+|------|------|
+| Signal / LinkQuality | 信号强度百分比 (0-100%) |
+| RSSI | 接收信号强度指示，单位 dBm（通常 -30 到 -90，越高越好） |
+| Security | 认证/加密算法（如 WPA2-Personal/CCMP、WPA3-Personal/GCMP） |
+| PHY | 物理层类型：Ht (Wi-Fi 4)、Vht (Wi-Fi 5)、He (Wi-Fi 6)、Eht (Wi-Fi 7) |
+| Freq/Band | 信道频率（MHz）和频段（2.4 GHz、5 GHz、6 GHz） |
+
 ### 3. 显示网卡信息
 
 列出所有无线网卡及其当前状态：
@@ -396,6 +478,27 @@ dotnet publish -c Release
 | `The network is not available` | 目标 SSID 不在范围内或为隐藏网络 | 靠近接入点，或确保 SSID 正在广播 |
 | 连接反复断开 | 信号弱或干扰 | 使用 `scan --mode bssid` 检查信号强度；考虑使用 BSSID 锁定防止漫游 |
 | 服务无法连接 | SYSTEM 账户无法访问用户的 Wi-Fi 配置文件 | 使用 `netsh wlan export profile folder=. key=clear` 导出配置文件为"所有用户"，然后重新导入 |
+| BSSID 模式频繁重连 | Windows WLAN AutoConfig 自动漫游 | 参见下方 [BSSID 模式与 AutoConfig 冲突](#bssid-模式与-autoconfig-冲突) |
+
+### BSSID 模式与 AutoConfig 冲突
+
+> ⚠️ **重要提示**：在 BSSID 模式下，Windows WLAN AutoConfig 服务可能会自动漫游到信号更强的接入点（BSSID），即使你已指定了目标 BSSID。这可能导致以下循环：
+>
+> 1. WiFiManager 连接到你指定的 BSSID
+> 2. AutoConfig 检测到更强的 AP 并自动漫游
+> 3. WiFiManager 检测到 BSSID 变化并重新连接
+> 4. 重复上述过程...
+
+**解决方案：**
+
+1. **禁用该网络配置文件的自动连接：**
+   ```powershell
+   netsh wlan set profileparameter name="你的SSID" connectionmode=manual
+   ```
+
+2. **改用 Gateway 模式** - 如果你只需要确保网络连通性（而不需要锁定特定 AP）。
+
+3. **调整信号环境** - 确保目标 AP 拥有最强的信号。
 
 **常用诊断命令：**
 
@@ -408,6 +511,15 @@ netsh wlan show profile name="MyWiFi" key=clear
 
 # 检查当前连接状态
 netsh wlan show interfaces
+
+# 查看 AutoConfig 状态
+netsh wlan show settings
+
+# 禁用指定网卡的 AutoConfig（需管理员）
+netsh wlan set autoconfig enabled=no interface="Wi-Fi"
+
+# 启用指定网卡的 AutoConfig
+netsh wlan set autoconfig enabled=yes interface="Wi-Fi"
 ```
 
 ## 退出码

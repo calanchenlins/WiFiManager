@@ -3,40 +3,59 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 /// <summary>
-/// A simple wrapper for native memory that ensures proper cleanup.
+/// A SafeHandle-based wrapper for native memory allocated via <see cref="Marshal.AllocHGlobal(int)"/>.
+/// Ensures proper cleanup even during exceptions.
 /// </summary>
-internal sealed class SafeNativeMemory : IDisposable
+/// <remarks>
+/// <para>
+/// This class inherits from SafeHandle to leverage the CLR's critical finalization guarantees,
+/// ensuring native memory is freed even if the finalizer thread is aborted.
+/// </para>
+/// <para>
+/// <b>Important:</b> Only use this class for memory allocated with <see cref="Marshal.AllocHGlobal(int)"/>.
+/// Do NOT use for memory returned by Windows APIs (e.g., WlanFreeMemory) as those require different deallocation.
+/// </para>
+/// </remarks>
+internal sealed class SafeNativeMemory : SafeHandle
 {
-    private IntPtr _pointer;
-
-    public SafeNativeMemory()
+    public SafeNativeMemory() : base(IntPtr.Zero, ownsHandle: true)
     {
-        _pointer = IntPtr.Zero;
     }
 
-    public SafeNativeMemory(int size)
+    public SafeNativeMemory(int size) : base(IntPtr.Zero, ownsHandle: true)
     {
-        _pointer = size > 0 ? Marshal.AllocHGlobal(size) : IntPtr.Zero;
+        if (size > 0)
+        {
+            SetHandle(Marshal.AllocHGlobal(size));
+        }
     }
 
-    public IntPtr Pointer => _pointer;
+    public override bool IsInvalid => handle == IntPtr.Zero;
 
+    public IntPtr Pointer => handle;
+
+    /// <summary>
+    /// Takes ownership of memory allocated via <see cref="Marshal.AllocHGlobal(int)"/>.
+    /// Frees any previously held memory before taking the new pointer.
+    /// </summary>
+    /// <param name="ptr">Pointer to memory allocated with <see cref="Marshal.AllocHGlobal(int)"/>. Must not be from other allocators.</param>
     public void TakeOwnership(IntPtr ptr)
     {
-        if (_pointer != IntPtr.Zero)
+        if (!IsInvalid)
         {
-            Marshal.FreeHGlobal(_pointer);
+            Marshal.FreeHGlobal(handle);
         }
-        _pointer = ptr;
+        SetHandle(ptr);
     }
 
-    public void Dispose()
+    protected override bool ReleaseHandle()
     {
-        if (_pointer != IntPtr.Zero)
+        if (!IsInvalid)
         {
-            Marshal.FreeHGlobal(_pointer);
-            _pointer = IntPtr.Zero;
+            Marshal.FreeHGlobal(handle);
+            SetHandle(IntPtr.Zero);
         }
+        return true;
     }
 }
 
@@ -142,6 +161,8 @@ internal sealed partial class WlanClient : IDisposable
         var ssidStruct = WlanNative.CreateSsid(ssid);
         using var ssidMem = new SafeNativeMemory(Marshal.SizeOf<DOT11_SSID>());
         using var bssidMem = new SafeNativeMemory();
+        // Note: profileMem takes ownership of memory from Marshal.StringToHGlobalUni,
+        // which internally uses AllocHGlobal, so SafeNativeMemory can safely free it.
         using var profileMem = new SafeNativeMemory();
         TaskCompletionSource<bool>? tcs = null;
 
@@ -229,7 +250,7 @@ internal sealed partial class WlanClient : IDisposable
         {
             var attrs = Marshal.PtrToStructure<WLAN_CONNECTION_ATTRIBUTES>(dataPtr);
             var ssid = WlanNative.SsidToString(attrs.wlanAssociationAttributes.dot11Ssid);
-            var bssid = WlanNative.MacToString(attrs.wlanAssociationAttributes.dot11Bssid.Address);
+            var bssid = WlanNative.MacToString(attrs.wlanAssociationAttributes.dot11Bssid);
             var signalQuality = attrs.wlanAssociationAttributes.wlanSignalQuality;
             return new CurrentConnectionInfo(true, ssid, bssid, signalQuality);
         }
@@ -319,7 +340,9 @@ internal sealed partial class WlanClient : IDisposable
                     net.dot11BssType,
                     net.wlanSignalQuality,
                     net.bSecurityEnabled,
-                    net.uNumberOfBssids));
+                    net.uNumberOfBssids,
+                    net.dot11DefaultAuthAlgorithm,
+                    net.dot11DefaultCipherAlgorithm));
 
                 itemPtr = IntPtr.Add(itemPtr, Marshal.SizeOf<WLAN_AVAILABLE_NETWORK>());
             }
@@ -345,7 +368,7 @@ internal sealed partial class WlanClient : IDisposable
                 var entry = Marshal.PtrToStructure<WLAN_BSS_ENTRY>(itemPtr);
                 result.Add(new BssEntry(
                     WlanNative.SsidToString(entry.dot11Ssid),
-                    WlanNative.MacToString(entry.dot11Bssid.Address),
+                    WlanNative.MacToString(entry.dot11Bssid),
                     entry.lRssi,
                     entry.uLinkQuality,
                     entry.ulChCenterFrequency,
@@ -394,6 +417,12 @@ internal sealed partial class WlanClient : IDisposable
 
     private void OnNotification(ref WLAN_NOTIFICATION_DATA notificationData, IntPtr context)
     {
+        // Skip processing if already disposed to avoid logging during finalization
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return;
+        }
+
         if (notificationData.NotificationSource != WLAN_NOTIFICATION_SOURCE.ACM)
         {
             return;
@@ -581,19 +610,20 @@ internal static class WlanNative
 
     public static IntPtr CreateBssidList(string bssid)
     {
+        ArgumentNullException.ThrowIfNull(bssid);
         var macBytes = ParseMac(bssid);
+        // DOT11_BSSID_LIST structure:
+        // - NDIS_OBJECT_HEADER (4 bytes)
+        // - uNumOfEntries (4 bytes)
+        // - uTotalNumOfEntries (4 bytes)
+        // - BSSIDs[1] (6 bytes for one MAC address)
+        // Total: 18 bytes, but we use Marshal.SizeOf for proper alignment
         var list = new DOT11_BSSID_LIST
         {
-            Header = new NDIS_OBJECT_HEADER(0, 1, (ushort)Marshal.SizeOf<DOT11_BSSID_LIST>()),
+            Header = new NDIS_OBJECT_HEADER(0x80, 1, (ushort)Marshal.SizeOf<DOT11_BSSID_LIST>()),  // Type 0x80 = NDIS_OBJECT_TYPE_DEFAULT
             NumOfEntries = 1,
             TotalNumOfEntries = 1,
-            BssidEntry = new DOT11_BSSID_ENTRY
-            {
-                Bssid = new DOT11_MAC_ADDRESS(macBytes),
-                BssType = DOT11_BSS_TYPE.Any,
-                PhyType = DOT11_PHY_TYPE.Unknown,
-                Reserved = new byte[16]
-            }
+            BSSIDs = macBytes
         };
 
         var ptr = Marshal.AllocHGlobal(Marshal.SizeOf<DOT11_BSSID_LIST>());
@@ -707,7 +737,35 @@ internal static class WlanNative
 // - Native Win32 structs/enums use SCREAMING_SNAKE_CASE (e.g., WLAN_INTERFACE_INFO) to match Windows SDK headers.
 // - Managed wrapper types use PascalCase (e.g., AvailableNetwork, BssEntry).
 
-internal sealed record AvailableNetwork(string SSID, DOT11_BSS_TYPE BssType, uint SignalQuality, bool SecurityEnabled, uint BssCount);
+/// <summary>
+/// Represents a Wi-Fi network discovered during a scan, grouped by SSID.
+/// </summary>
+/// <param name="SSID">The Service Set Identifier (network name).</param>
+/// <param name="BssType">The BSS type (Infrastructure, Independent, or Any).</param>
+/// <param name="SignalQuality">Signal quality as a percentage (0-100).</param>
+/// <param name="SecurityEnabled">Indicates whether security is enabled on this network.</param>
+/// <param name="BssCount">The number of BSSIDs (access points) broadcasting this SSID.</param>
+/// <param name="AuthAlgorithm">The default authentication algorithm used by this network.</param>
+/// <param name="CipherAlgorithm">The default cipher algorithm used by this network.</param>
+internal sealed record AvailableNetwork(
+    string SSID,
+    DOT11_BSS_TYPE BssType,
+    uint SignalQuality,
+    bool SecurityEnabled,
+    uint BssCount,
+    DOT11_AUTH_ALGORITHM AuthAlgorithm,
+    DOT11_CIPHER_ALGORITHM CipherAlgorithm);
+
+/// <summary>
+/// Represents a single BSS (Basic Service Set) entry, providing detailed per-access-point information.
+/// </summary>
+/// <param name="Ssid">The Service Set Identifier (network name).</param>
+/// <param name="Bssid">The MAC address of the access point.</param>
+/// <param name="Rssi">Received Signal Strength Indicator in dBm (typically -30 to -90).</param>
+/// <param name="LinkQuality">Link quality as a percentage (0-100).</param>
+/// <param name="FrequencyKhz">The channel center frequency in kHz.</param>
+/// <param name="BssType">The BSS type (Infrastructure or Independent).</param>
+/// <param name="PhyType">The PHY type indicating the Wi-Fi standard (e.g., HE for Wi-Fi 6).</param>
 internal sealed record BssEntry(string Ssid, string Bssid, int Rssi, uint LinkQuality, uint FrequencyKhz, DOT11_BSS_TYPE BssType, DOT11_PHY_TYPE PhyType);
 
 [StructLayout(LayoutKind.Sequential)]
@@ -944,18 +1002,6 @@ internal readonly struct NDIS_OBJECT_HEADER
     }
 }
 
-[StructLayout(LayoutKind.Sequential, Pack = 1)]
-internal readonly struct DOT11_MAC_ADDRESS
-{
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
-    public readonly byte[] Address;
-
-    public DOT11_MAC_ADDRESS(byte[] address)
-    {
-        Address = address;
-    }
-}
-
 internal enum DOT11_PHY_TYPE : uint
 {
     Unknown = 0,
@@ -1021,13 +1067,14 @@ internal struct WLAN_BSS_ENTRY
 {
     public DOT11_SSID dot11Ssid;
     public uint uPhyId;
-    public DOT11_MAC_ADDRESS dot11Bssid;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
+    public byte[] dot11Bssid;  // DOT11_MAC_ADDRESS inlined as 6 bytes
     public DOT11_BSS_TYPE dot11BssType;
     public DOT11_PHY_TYPE dot11BssPhyType;
     public int lRssi;
     public uint uLinkQuality;
-    [MarshalAs(UnmanagedType.Bool)]
-    public bool bInRegDomain;
+    [MarshalAs(UnmanagedType.U1)]
+    public bool bInRegDomain;  // BOOLEAN is 1 byte, not 4 bytes (BOOL)
     public ushort usBeaconPeriod;
     public ulong ullTimestamp;
     public ulong ullHostTimestamp;
@@ -1047,31 +1094,13 @@ internal struct WLAN_RATE_SET
 }
 
 [StructLayout(LayoutKind.Sequential)]
-internal struct DOT11_BSSID_ENTRY
-{
-    public DOT11_MAC_ADDRESS Bssid;
-    public DOT11_BSS_TYPE BssType;
-    public DOT11_PHY_TYPE PhyType;
-    public int Rssi;
-    public uint LinkQuality;
-    [MarshalAs(UnmanagedType.Bool)]
-    public bool InRegDomain;
-    public ushort BeaconPeriod;
-    public ulong Timestamp;
-    public ulong HostTimestamp;
-    public ushort CapabilityInformation;
-    public uint ChCenterFrequency;
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
-    public byte[] Reserved;
-}
-
-[StructLayout(LayoutKind.Sequential)]
 internal struct DOT11_BSSID_LIST
 {
     public NDIS_OBJECT_HEADER Header;
     public uint NumOfEntries;
     public uint TotalNumOfEntries;
-    public DOT11_BSSID_ENTRY BssidEntry;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
+    public byte[] BSSIDs;  // Variable length array of MAC addresses (6 bytes each), we only need 1
 }
 
 internal enum WLAN_INTF_OPCODE : uint
@@ -1122,7 +1151,8 @@ internal struct WLAN_ASSOCIATION_ATTRIBUTES
 {
     public DOT11_SSID dot11Ssid;
     public DOT11_BSS_TYPE dot11BssType;
-    public DOT11_MAC_ADDRESS dot11Bssid;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
+    public byte[] dot11Bssid;  // DOT11_MAC_ADDRESS inlined as 6 bytes
     public DOT11_PHY_TYPE dot11PhyType;
     public uint uDot11PhyIndex;
     public uint wlanSignalQuality;
@@ -1141,6 +1171,13 @@ internal struct WLAN_SECURITY_ATTRIBUTES
     public DOT11_CIPHER_ALGORITHM dot11CipherAlgorithm;
 }
 
+/// <summary>
+/// Represents the current Wi-Fi connection state and details.
+/// </summary>
+/// <param name="IsConnected">Indicates whether the interface is currently connected to a network.</param>
+/// <param name="Ssid">The SSID of the connected network, or <c>null</c> if not connected.</param>
+/// <param name="Bssid">The BSSID (MAC address) of the connected access point, or <c>null</c> if not connected.</param>
+/// <param name="SignalQuality">Signal quality as a percentage (0-100), or 0 if not connected.</param>
 internal sealed record CurrentConnectionInfo(bool IsConnected, string? Ssid, string? Bssid, uint SignalQuality);
 
 #endregion
