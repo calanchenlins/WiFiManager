@@ -184,6 +184,7 @@ The executable will be in `bin/Release/net8.0/win-x64/publish/`.
 | `Connection attempt failed` | Wi-Fi profile not saved in Windows | Manually connect to the network once via Windows Settings to create the profile |
 | `No Wi-Fi interfaces found` | No wireless adapter detected or driver issue | Check Device Manager, ensure Wi-Fi adapter is enabled and drivers are installed |
 | `Access is denied` (Error 5) | Insufficient permissions | Run as Administrator, or ensure the user has rights to manage Wi-Fi |
+| `WlanConnect failed with error 50` | WLAN AutoConfig disabled for this interface | **Re-enable AutoConfig**: `netsh wlan set autoconfig enabled=yes interface="Wi-Fi"`. See warning below. |
 | `The network is not available` | Target SSID not in range or hidden | Move closer to AP, or ensure SSID is broadcasting |
 | Connection drops repeatedly | Weak signal or interference | Use `scan --mode bssid` to check signal strength; consider BSSID lock to prevent roaming |
 | Service fails to connect | SYSTEM account cannot access user Wi-Fi profiles | Export the profile as "All Users" using `netsh wlan export profile folder=. key=clear` and re-import |
@@ -223,13 +224,12 @@ netsh wlan show interfaces
 
 # Check AutoConfig status
 netsh wlan show settings
-
-# Disable AutoConfig for an interface (requires admin)
-netsh wlan set autoconfig enabled=no interface="Wi-Fi"
-
-# Enable AutoConfig for an interface
-netsh wlan set autoconfig enabled=yes interface="Wi-Fi"
 ```
+
+> ⛔ **Do NOT disable WLAN AutoConfig**: WiFiManager relies on the Windows WLAN AutoConfig service to function. If you run `netsh wlan set autoconfig enabled=no`, all WiFiManager connection operations will fail with **Error 50 (ERROR_NOT_SUPPORTED)**, and Windows may also show incorrect connection status. If you have already disabled it, re-enable with:
+> ```powershell
+> netsh wlan set autoconfig enabled=yes interface="Wi-Fi"
+> ```
 
 ## Exit Codes
 
@@ -475,6 +475,7 @@ dotnet publish -c Release
 | `Connection attempt failed` | Windows 中未保存该 Wi-Fi 配置文件 | 先通过 Windows 设置手动连接一次该网络以创建配置文件 |
 | `No Wi-Fi interfaces found` | 未检测到无线网卡或驱动问题 | 检查设备管理器，确保 Wi-Fi 适配器已启用且驱动已安装 |
 | `Access is denied` (错误 5) | 权限不足 | 以管理员身份运行，或确保用户具有管理 Wi-Fi 的权限 |
+| `WlanConnect failed with error 50` | 该网卡的 WLAN AutoConfig 已被禁用 | **重新启用 AutoConfig**：`netsh wlan set autoconfig enabled=yes interface="Wi-Fi"`。详见下方警告。 |
 | `The network is not available` | 目标 SSID 不在范围内或为隐藏网络 | 靠近接入点，或确保 SSID 正在广播 |
 | 连接反复断开 | 信号弱或干扰 | 使用 `scan --mode bssid` 检查信号强度；考虑使用 BSSID 锁定防止漫游 |
 | 服务无法连接 | SYSTEM 账户无法访问用户的 Wi-Fi 配置文件 | 使用 `netsh wlan export profile folder=. key=clear` 导出配置文件为"所有用户"，然后重新导入 |
@@ -514,13 +515,12 @@ netsh wlan show interfaces
 
 # 查看 AutoConfig 状态
 netsh wlan show settings
-
-# 禁用指定网卡的 AutoConfig（需管理员）
-netsh wlan set autoconfig enabled=no interface="Wi-Fi"
-
-# 启用指定网卡的 AutoConfig
-netsh wlan set autoconfig enabled=yes interface="Wi-Fi"
 ```
+
+> ⛔ **请勿禁用 WLAN AutoConfig**：WiFiManager 依赖 Windows WLAN AutoConfig 服务才能正常工作。如果你执行了 `netsh wlan set autoconfig enabled=no`，所有 WiFiManager 的连接操作都会失败并返回**错误 50 (ERROR_NOT_SUPPORTED)**，同时 Windows 系统界面也可能显示错误的连接状态。如果你已禁用，请运行以下命令重新启用：
+> ```powershell
+> netsh wlan set autoconfig enabled=yes interface="Wi-Fi"
+> ```
 
 ## 退出码
 
